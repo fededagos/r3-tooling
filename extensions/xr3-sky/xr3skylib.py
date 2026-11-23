@@ -266,8 +266,8 @@ export PATH="$HOME/.local/bin:$PATH"
 command -v uv || curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 export UV_CACHE_DIR=$HOME/.cache/uv
-uv tool install "r3 @ git+https://github.com/mtangemann/r3@{r3_ref}"
-uv tool install awscli
+uv tool install --force "r3 @ git+https://github.com/mtangemann/r3@{r3_ref}"
+uv tool install --force awscli
 """
 
 
@@ -285,7 +285,7 @@ def render_task(*, name: str, job_id: str, task: dict, deps: list,
         "XR3SKY_GIT": " ".join(f"{s}:{p}:{c}" for s, p, c in git),
         "XR3SKY_SYNC_INTERVAL": str(sky_cfg["sync_interval"]),
         "XR3SKY_ENDPOINT": str(sky_cfg["endpoint"]),
-        "XR3SKY_ENDPOINT_INTERNAL": str(sky_cfg["endpoint_internal"]),
+        "XR3SKY_ENDPOINT_INTERNAL": str(sky_cfg.get("endpoint_internal") or ""),
     })
     names = list(secret_names) + list(out.get("secrets") or {}) + [
         "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]

@@ -270,8 +270,8 @@ def test_render_task_secrets_merge_dedupe_order():
 def test_render_task_setup_idempotent_snippet():
     s = _render()["setup"]
     assert "command -v uv ||" in s and "astral.sh/uv/install.sh" in s
-    assert 'uv tool install "r3 @ git+https://github.com/mtangemann/r3@a65b646"' in s
-    assert "uv tool install awscli" in s
+    assert 'uv tool install --force "r3 @ git+https://github.com/mtangemann/r3@a65b646"' in s
+    assert "uv tool install --force awscli" in s
     assert "UV_CACHE_DIR=$HOME/.cache/uv" in s and ".local/bin" in s
 
 
@@ -287,3 +287,22 @@ def test_render_task_does_not_mutate_inputs_and_keeps_keys():
         assert t[k] == task[k]
     t["envs"]["Z"] = "1"; t["resources"]["cpus"] = 9
     assert "Z" not in task["envs"] and task["resources"]["cpus"] == 2
+
+
+def test_render_task_setup_uses_force_for_both_installs():
+    lines = [l for l in _render()["setup"].splitlines() if l.startswith("uv tool install")]
+    assert len(lines) == 2 and all("--force" in l for l in lines)
+
+
+def test_render_task_missing_internal_endpoint_is_empty_string():
+    for cfg in ({**RCFG, "endpoint_internal": None},
+                {k: v for k, v in RCFG.items() if k != "endpoint_internal"}):
+        assert _render(sky_cfg=cfg)["envs"]["XR3SKY_ENDPOINT_INTERNAL"] == ""
+
+
+def test_render_task_fragment_secret_value_is_dropped():
+    import yaml
+    task = {"secrets": {"WANDB_API_KEY": "sekrit"}}
+    t = _render(task=task)
+    assert t["secrets"]["WANDB_API_KEY"] is None
+    assert "sekrit" not in yaml.safe_dump(t)
