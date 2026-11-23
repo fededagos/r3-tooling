@@ -166,3 +166,58 @@ def test_logs_and_cancel_without_managed_job(env, monkeypatch):
         r = run(cmd, env["main"])
         assert r.exit_code != 0
         assert f"no managed job named tester-r3-{env['main'][:8]}" in r.output
+
+
+def test_pull_downloads_done_last(env, monkeypatch):
+    seed_output(env, env["main"], {"a.txt": b"a", "z.txt": b"z"})
+    store = env["store"]
+    orig = store.download_file
+
+    def flaky(key, path):
+        if key.endswith("z.txt"):
+            raise OSError("connection lost")
+        orig(key, path)
+    monkeypatch.setattr(store, "download_file", flaky)
+    r = CliRunner().invoke(cli_mod.cli, ["pull", env["main"]])
+    assert r.exit_code != 0
+    assert not (out_dir(env, env["main"]) / "done").exists()
+
+
+def test_pull_rejects_unsafe_keys(env):
+    prefix = LAYOUT.output(env["main"])
+    seed_output(env, env["main"], {"ok.txt": b"ok"})
+    env["store"].objects[prefix + "../../r3.yaml"] = b"evil"
+    env["store"].objects[prefix + "/etc/x"] = b"evil"
+    r3yaml = env["repo"] / "jobs" / env["main"] / "r3.yaml"
+    before = r3yaml.read_bytes()
+    r = run("pull", env["main"])
+    assert r.exit_code == 0, r.output
+    assert r.output.count("WARNING: skipping unsafe S3 key") == 2
+    assert r3yaml.read_bytes() == before
+    assert (out_dir(env, env["main"]) / "ok.txt").read_bytes() == b"ok"
+
+
+def test_pull_skips_remote_yaml_key_and_unknown_job(env):
+    seed_output(env, env["main"], {"REMOTE.yaml": b"theirs", "a.txt": b"a"})
+    run("pull", env["main"])
+    assert not (out_dir(env, env["main"]) / "REMOTE.yaml").exists()
+    r = run("pull", "00000000-0000-0000-0000-000000000000")
+    assert r.exit_code != 0
+    assert "not in local repository" in r.output and "Traceback" not in r.output
+
+
+def test_store_without_boto3_is_clean_error(monkeypatch):
+    def boom(*a, **k):
+        raise ImportError("no boto3")
+    monkeypatch.setattr(cli_mod.s3, "BotoStore", boom)
+    with pytest.raises(cli_mod.click.ClickException, match="boto3 is not installed"):
+        cli_mod._store({"bucket": "b", "endpoint": "e", "aws_profile": None})
+
+
+def test_status_read_error_degrades(env, monkeypatch):
+    def bad(key):
+        raise RuntimeError("500")
+    monkeypatch.setattr(env["store"], "read_text", bad)
+    r = run("status")
+    assert r.exit_code == 0, r.output
+    assert "S3 unreachable" in r.output

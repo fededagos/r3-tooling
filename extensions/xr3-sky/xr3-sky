@@ -48,7 +48,11 @@ def _sky_config() -> dict:
 
 def _store(cfg: dict) -> s3.Store:
     """The S3 store for the `sky` config section (tests monkeypatch this)."""
-    return s3.BotoStore(cfg["bucket"], cfg["endpoint"], cfg["aws_profile"])
+    try:
+        return s3.BotoStore(cfg["bucket"], cfg["endpoint"], cfg["aws_profile"])
+    except ImportError:
+        raise click.ClickException("boto3 is not installed in this environment — "
+                                   "re-run the r3-tooling installer")
 
 
 def _build_query(tags, queries) -> dict:
@@ -564,18 +568,32 @@ def _pull_job(job_id: str, repo_path: Path, store, layout: lib.S3Layout, bucket:
     out.mkdir(exist_ok=True)
     _make_writable(out)
     downloaded = skipped = 0
-    for obj in download:
+    out_real = out.resolve()
+    done_key = layout.done(job_id)
+    # `done` goes last: an interrupted pull must never leave a local done marker
+    # with files missing.
+    ordered = [o for o in download if o.key != done_key] + \
+              [o for o in download if o.key == done_key]
+    for obj in ordered:
         rel = obj.key[len(prefix):]
-        if not rel or rel.endswith("/"):
+        if not rel or rel.endswith("/") or rel == "REMOTE.yaml":
             continue
+        parts = Path(rel).parts
         dest = out / rel
+        if (Path(rel).is_absolute() or ".." in parts
+                or not dest.resolve().is_relative_to(out_real)):
+            print(f"WARNING: skipping unsafe S3 key {obj.key!r}")
+            continue
         if _up_to_date(obj, dest):
             skipped += 1
             continue
-        for d in reversed([p for p in dest.parents if out in p.parents or p == out]):
+        d = out
+        for part in parts[:-1]:
+            d = d / part
             if d.exists():
                 _make_writable(d)
-        dest.parent.mkdir(parents=True, exist_ok=True)
+            else:
+                d.mkdir()
         if dest.exists():
             _make_writable(dest)
         store.download_file(obj.key, dest)
@@ -614,6 +632,10 @@ def pull(job_ids, tags, queries, max_size, all_files):
     paths = _select_paths(repository, job_ids, tags, queries)
     layout = lib.S3Layout(str(sky_cfg["prefix"]).rstrip("/"))
     for path in paths:
+        try:
+            repository[path.name]
+        except KeyError:
+            raise click.ClickException(f"job {path.name} not in local repository")
         _pull_job(path.name, Path(repository.path), store, layout, sky_cfg["bucket"],
                   max_bytes)
 
@@ -704,7 +726,8 @@ def status(globs):
             try:
                 remote_text = store.read_text(layout.done(job.id))
             except Exception:
-                remote_text = None
+                reachable = False
+                print("(S3 unreachable — done column from local markers only)")
         done = lib.effective_done(remote_text,
                                   local.read_text() if local.is_file() else None)
         if managed is None:
