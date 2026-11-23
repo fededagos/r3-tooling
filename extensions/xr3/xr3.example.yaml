@@ -28,3 +28,17 @@ slurm:                     # read only by xr3-slurm (MLCloud / galvani; ports to
   exclude_nodes: []        # e.g. ["galvani-cn221", "galvani-cn240"]
   partition: null          # default --partition
   mem: null                # default --mem
+
+# sky:                       # read only by xr3-sky (SkyPilot managed jobs, Ceph S3 transport)
+#   bucket: federico-r3
+#   prefix: r3
+#   endpoint: https://rgw-cold.enigmatic.stanford.edu
+#   endpoint_internal: http://rgw-cold.rook-ceph.svc   # in-cluster S3 endpoint
+#   aws_profile: enigma
+#   user: null                 # null => local part of $SKYPILOT_USER
+#   sync_interval: 300
+#   pull_max_size: 100MB
+#   push_confirm_above: 5GB
+#   secrets: [WANDB_API_KEY]   # names; values from the laptop env
+#   defaults:                  # SkyPilot task fragment, merged under each job's sky.yaml
+#     resources: {cpus: 4, memory: 16}

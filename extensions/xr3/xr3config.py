@@ -25,6 +25,21 @@ DEFAULTS = {
         "partition": None,          # default sbatch --partition (null => omit)
         "mem": None,                # default sbatch --mem (null => omit)
     },
+    "sky": {
+        "bucket": "federico-r3",
+        "prefix": "r3",
+        "endpoint": "https://rgw-cold.enigmatic.stanford.edu",
+        "endpoint_internal": "http://rgw-cold.rook-ceph.svc",  # in-cluster S3 endpoint
+        "aws_profile": "enigma",
+        "user": None,               # null => local part of $SKYPILOT_USER
+        "sync_interval": 300,
+        "pull_max_size": "100MB",
+        "push_confirm_above": "5GB",
+        "secrets": ["WANDB_API_KEY"],   # names; values from the laptop env
+        "allow_float_gpu": False,       # reserved, unused
+        # SkyPilot task fragment, merged under each job's sky.yaml
+        "defaults": {"resources": {"cpus": 4, "memory": 16}},
+    },
 }
 
 
