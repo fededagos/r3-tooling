@@ -23,7 +23,7 @@ SLURM_HEADNODES=()
 SLURM_SUBMIT_HOST=""
 NO_SLURM=0
 INSTALL_SKILL="prompt"      # prompt | yes | no (resolved to yes/no in interactive_config)
-SKILL_TARGET="all"          # all | claude | codex
+SKILL_TARGET="all"          # all | claude | codex | agents
 IMPORT_CONTEXT="prompt"     # prompt | yes | no — add the workflow @import to a CLAUDE.md
 CONTEXT_CLAUDE_MD="$HOME/.claude/CLAUDE.md"   # target for the @import (--import-context)
 ASSUME_YES=0
@@ -68,8 +68,9 @@ SLURM:
   --slurm-headnode HOST   (repeatable)   --slurm-submit-host HOST   --no-slurm
 
 Skill:
-  --install-skill / --no-install-skill   --skill-target all|claude|codex
-                         (links skills/r3 and skills/xr3-sky)
+  --install-skill / --no-install-skill   --skill-target all|claude|codex|agents
+                         (links skills/r3 and skills/xr3-sky into ~/.claude/skills,
+                          ~/.codex/skills and/or ~/.agents/skills; all = all three)
 
 Agent context (point agents at RESEARCH_WORKFLOW.md via a CLAUDE.md @import):
   --import-context / --no-import-context   --context-claude-md PATH  (default ~/.claude/CLAUDE.md)
@@ -174,7 +175,7 @@ interactive_config() {
   # Skill decision (resolve "prompt" -> yes/no now, so it happens before any relocate).
   if [ "$INSTALL_SKILL" = "prompt" ]; then
     if [ "$INTERACTIVE" -eq 1 ]; then
-      local a=""; read -r -p "  install the agent skills (r3, xr3-sky) for claude/codex? (yes/no) [yes]: " a < /dev/tty || true
+      local a=""; read -r -p "  install the agent skills (r3, xr3-sky) for claude/codex/agents? (yes/no) [yes]: " a < /dev/tty || true
       case "${a:-yes}" in y|Y|yes|YES) INSTALL_SKILL=yes;; *) INSTALL_SKILL=no;; esac
     else
       INSTALL_SKILL=yes
@@ -196,7 +197,7 @@ interactive_config() {
 
 resolve_defaults() {
   case "$CLONE_PROTO" in ssh|https) ;; *) err "--clone-proto must be ssh or https (got: $CLONE_PROTO)"; exit 2;; esac
-  case "$SKILL_TARGET" in all|claude|codex) ;; *) err "--skill-target must be all|claude|codex (got: $SKILL_TARGET)"; exit 2;; esac
+  case "$SKILL_TARGET" in all|claude|codex|agents) ;; *) err "--skill-target must be all|claude|codex|agents (got: $SKILL_TARGET)"; exit 2;; esac
   [ -n "$VENV_DIR" ] || VENV_DIR="$TOOLCHAIN_ROOT/.venv"
   [ -n "$BIN_DIR" ] || BIN_DIR="$(_default_bindir)"
   local host="github.com"
@@ -451,9 +452,15 @@ phase_skill() {
 
   # skills/r3 is the pure r3 skill; skills/xr3-sky is the house skill for the
   # xr3-sky SkyPilot launcher. Both link into the same agent skill dirs.
+  # ~/.claude/skills and ~/.codex/skills are used only if that agent is installed (dir
+  # present); ~/.agents/skills is the shared cross-agent dir, created if missing.
   link_skill() { # AGENT_DIR SKILL_NAME
     local d="$1" name="$2" src="$REPO_DIR/skills/$2"
-    [ -d "$d" ] || { info "skill: $d absent, skipping $name"; return; }
+    if [ "$d" = "$HOME/.agents/skills" ] && [ ! -d "$d" ]; then
+      run mkdir -p "$d" || { warn "skill: cannot create $d; skipping $name"; return; }
+    elif [ ! -d "$d" ]; then
+      info "skill: $d absent, skipping $name"; return
+    fi
     if [ -e "$d/$name" ] && [ ! -L "$d/$name" ]; then warn "skill: $d/$name exists and is not a symlink; skipping"; return; fi
     run ln -sfn "$src" "$d/$name" || { warn "could not link skill $name into $d"; return; }
     if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) would link skill -> $d/$name"; else info "skill linked -> $d/$name"; fi
@@ -462,7 +469,8 @@ phase_skill() {
   case "$SKILL_TARGET" in
     claude) dirs=("$HOME/.claude/skills");;
     codex)  dirs=("$HOME/.codex/skills");;
-    all|*)  dirs=("$HOME/.claude/skills" "$HOME/.codex/skills");;
+    agents) dirs=("$HOME/.agents/skills");;
+    all|*)  dirs=("$HOME/.claude/skills" "$HOME/.codex/skills" "$HOME/.agents/skills");;
   esac
   local d name
   for d in "${dirs[@]}"; do

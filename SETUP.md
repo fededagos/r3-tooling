@@ -8,10 +8,11 @@ are two ways to get there: run the installer (§1, recommended), or do the same 
 
 ## 0. The r3 skill (for agents)
 
-Install `skills/r3/` where your Claude Code (or codex) finds skills (see the top
-[README](README.md)). That's independent of the CLI setup below — `./install.sh
---install-skill` does it for you automatically (symlinking into `~/.claude/skills` and/or
-`~/.codex/skills`, see `--skill-target` in §1).
+Install `skills/r3/` (and the house `skills/xr3-sky/`, for SkyPilot runs) where your
+agents find skills (see the top [README](README.md)). That's independent of the CLI setup
+below — `./install.sh --install-skill` does it for you automatically, symlinking both into
+`~/.claude/skills`, `~/.codex/skills` and the shared cross-agent `~/.agents/skills` (see
+`--skill-target` in §1).
 
 ## 1. Quickstart — the installer
 
@@ -64,8 +65,11 @@ Common flags (all have real defaults, so `--yes` alone is a complete install):
 - `--slurm-headnode HOST` (repeatable) / `--slurm-submit-host HOST` / `--no-slurm` — SLURM
   config for `xr3-slurm`, or opt out of it entirely.
 - `--clone-proto ssh|https` (default `ssh`) — how `r3` and `foreman` are cloned.
-- `--install-skill` / `--no-install-skill` (plus `--skill-target all|claude|codex`) — install
-  the r3 agent skill from §0 as part of the same run.
+- `--install-skill` / `--no-install-skill` (plus `--skill-target all|claude|codex|agents`) —
+  install the agent skills from §0 as part of the same run. `all` (the default) links into
+  `~/.claude/skills`, `~/.codex/skills` and `~/.agents/skills`; the Claude and Codex dirs are
+  used only if they exist, `~/.agents/skills` is created if missing. An existing entry that
+  is not a symlink is never overwritten.
 
 `foreman` is currently **private** — the installer defaults to the `matthias-k/foreman` fork
 (ask the owner for access), tracking its **`dev`** branch (the newer features), and the default
@@ -92,8 +96,8 @@ The mental model, in one picture:
   `npm install` + `npx tailwindcss` in `foreman/static` to build it. This needs **node/npm**;
   if npm is missing the installer asks you to confirm skipping (default: abort so you can
   install npm first), and foreman then runs but renders **unstyled** until you build it.
-- **Optionally**, the r3 skill (§0) symlinked into `~/.claude/skills` and/or
-  `~/.codex/skills`.
+- **Optionally**, the agent skills (§0: `r3`, `xr3-sky`) symlinked into `~/.claude/skills`,
+  `~/.codex/skills` and/or `~/.agents/skills`.
 
 The clones themselves live under the toolchain root: `<toolchain-root>/r3` and
 `<toolchain-root>/foreman`. Note that `r3-tooling` — the repo you cloned to get `install.sh`

@@ -61,6 +61,7 @@ symlink it, or do it by hand so `git pull` keeps it current:
 
 ```bash
 ln -s "$(pwd)/skills/r3" ~/.claude/skills/r3                  # for all your projects
+# or:  ln -s "$(pwd)/skills/r3" ~/.agents/skills/r3           # the shared cross-agent dir
 # or:  ln -s "$(pwd)/skills/r3" <project>/.claude/skills/r3   # for one project
 ```
 
