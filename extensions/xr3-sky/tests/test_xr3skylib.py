@@ -47,3 +47,141 @@ def test_config_defaults_have_sky():
     cfg = xr3config.load_config("/nonexistent")
     assert cfg["sky"]["bucket"] == "federico-r3"
     assert cfg["sky"]["defaults"]["resources"] == {"cpus": 4, "memory": 16}
+
+
+# --- sky.yaml merge and validation -------------------------------------------
+
+def gpu_task(acc, gpumem=None, **extra):
+    t = {"resources": {"accelerators": f"{acc}:1"}, **extra}
+    if gpumem:
+        t["config"] = {"kubernetes": {"pod_config": {"spec": {"containers": [
+            {"resources": {"limits": {"nvidia.com/gpumem": gpumem}}}]}}}}
+    return t
+
+
+def _prio(task, name):
+    task = dict(task)
+    task["config"] = {"kubernetes": {"pod_config": {"spec": {"priorityClassName": name}}}}
+    return task
+
+
+def _validate(task, whole_card=False, allow_high=False, infra_override=None):
+    return lib.validate_and_fill(task, whole_card=whole_card, allow_high=allow_high,
+                                 infra_override=infra_override)
+
+
+def test_validate_hami_without_cap_refused():
+    with pytest.raises(lib.SkySpecError, match="needs a nvidia.com/gpumem cap") as e:
+        _validate(gpu_task("H100-80GB"))
+    assert "8155" in str(e.value) and "81559" in str(e.value)
+
+
+def test_validate_whole_card_fills_value():
+    t = _validate(gpu_task("RTXPRO6000"), whole_card=True)
+    assert lib.gpumem_of(t) == 97887
+    assert lib.accelerator_of(t) == "RTXPRO6000"
+
+
+def test_validate_whole_card_does_not_mutate_input():
+    src = gpu_task("L40S")
+    _validate(src, whole_card=True)
+    assert "config" not in src
+
+
+def test_validate_non_hami_needs_no_cap():
+    _validate(gpu_task("RTX3090"))
+
+
+def test_validate_cap_within_card_ok():
+    t = _validate(gpu_task("H100-80GB", gpumem=8155))
+    assert lib.gpumem_of(t) == 8155
+
+
+def test_validate_gpumem_exceeds_whole_card():
+    with pytest.raises(lib.SkySpecError, match="exceeds"):
+        _validate(gpu_task("L40S", gpumem=46069))
+
+
+def test_validate_resources_config_refused():
+    t = {"resources": {"config": {}}}
+    with pytest.raises(lib.SkySpecError, match="config: must be top-level"):
+        _validate(t)
+
+
+def test_validate_num_nodes_must_be_one():
+    with pytest.raises(lib.SkySpecError, match="num_nodes must be 1"):
+        _validate({"num_nodes": 2})
+    _validate({"num_nodes": 1})
+
+
+def test_validate_accelerator_list_refused():
+    t = {"resources": {"accelerators": ["H100-80GB:1", "L40S:1"]}}
+    with pytest.raises(lib.SkySpecError, match="GPU jobs must pin exactly one accelerator"):
+        _validate(t)
+
+
+def test_validate_accelerator_set_refused():
+    t = {"resources": {"accelerators": {"H100-80GB", "L40S"}}}
+    with pytest.raises(lib.SkySpecError, match="GPU jobs must pin exactly one accelerator"):
+        _validate(t)
+
+
+def test_validate_any_of_with_gpu_refused():
+    t = {"resources": {"any_of": [{"accelerators": "L40S:1"}, {"cpus": 4}]}}
+    with pytest.raises(lib.SkySpecError, match="GPU jobs must pin exactly one accelerator"):
+        _validate(t)
+
+
+def test_validate_ordered_with_gpu_refused():
+    t = {"resources": {"ordered": [{"accelerators": {"RTX3090": 1}}]}}
+    with pytest.raises(lib.SkySpecError, match="GPU jobs must pin exactly one accelerator"):
+        _validate(t)
+
+
+def test_validate_single_key_dict_accelerator_ok():
+    t = {"resources": {"accelerators": {"RTX3090": 1}}}
+    assert lib.accelerator_of(_validate(t)) == "RTX3090"
+
+
+def test_validate_priority_class_unknown():
+    with pytest.raises(lib.SkySpecError, match="priority class"):
+        _validate(_prio({}, "urgent"))
+
+
+def test_validate_high_priority_needs_flag():
+    with pytest.raises(lib.SkySpecError, match="--allow-high"):
+        _validate(_prio({}, "high"))
+    _validate(_prio({}, "high"), allow_high=True)
+    _validate(_prio({}, "low"))
+
+
+def test_validate_do_volume_refused():
+    with pytest.raises(lib.SkySpecError, match="DO has no persistent volume"):
+        _validate({"volumes": {"/data": "do-scratch"}})
+    _validate({"volumes": {"/data": "at-persist"}})
+
+
+def test_validate_infra_override_contradiction():
+    t = {"resources": {"infra": "k8s/at"}}
+    with pytest.raises(lib.SkySpecError, match="--infra contradicts sky.yaml"):
+        _validate(t, infra_override="k8s/morpho")
+    assert _validate(t, infra_override="k8s/at")["resources"]["infra"] == "k8s/at"
+
+
+def test_validate_infra_override_sets_when_absent():
+    t = _validate({}, infra_override="k8s/morpho")
+    assert t["resources"]["infra"] == "k8s/morpho"
+
+
+def test_merge_job_wins_and_deep_merges():
+    defaults = {"resources": {"cpus": 4, "infra": "k8s/at"}, "envs": {"A": "1", "B": "2"}}
+    frag = {"resources": {"cpus": 8}, "envs": {"B": "3"}, "num_nodes": 1}
+    out = lib.merge_task(defaults, frag)
+    assert out == {"resources": {"cpus": 8, "infra": "k8s/at"},
+                   "envs": {"A": "1", "B": "3"}, "num_nodes": 1}
+    assert defaults["resources"]["cpus"] == 4 and frag["envs"] == {"B": "3"}
+
+
+def test_merge_rejects_owned_keys():
+    with pytest.raises(lib.SkySpecError):
+        lib.merge_task({}, {"run": "echo hi"})

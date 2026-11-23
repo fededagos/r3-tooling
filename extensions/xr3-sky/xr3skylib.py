@@ -1,9 +1,10 @@
 """Pure helpers for xr3-sky (stdlib only; unit-testable without sky/r3/boto3).
 
-Sections: sizes, identity & naming, S3 key layout.
+Sections: sizes, identity & naming, S3 key layout, sky.yaml merge & validation.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import re
 from dataclasses import dataclass
@@ -74,3 +75,146 @@ class S3Layout:
 
     def run_record(self, job_id: str, ts: str) -> str:
         return f"{self.prefix}/runs/{job_id}/{ts}/task.yaml"
+
+
+# --- sky.yaml merge & validation ---------------------------------------------
+
+class SkySpecError(ValueError):
+    """A job's sky.yaml (merged with defaults) is not safe to submit."""
+
+
+# gpumem in MiB: (one slot, whole card)
+HAMI_GPUMEM: dict[str, tuple[int, int]] = {
+    "RTXPRO6000": (9788, 97887),
+    "H100-80GB": (8155, 81559),
+    "L40S": (4606, 46068),
+}
+
+_JOB_KEYS = {"resources", "config", "envs", "secrets", "num_nodes"}
+_PRIORITY_CLASSES = ("low", "medium", "high")
+_GPUMEM_KEY = "nvidia.com/gpumem"
+
+
+def _deep_merge(base: dict, over: dict) -> dict:
+    out = copy.deepcopy(base)
+    for k, v in over.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = copy.deepcopy(v)
+    return out
+
+
+def merge_task(defaults: dict, job_fragment: dict) -> dict:
+    """Deep-merge a job's sky.yaml fragment over the defaults (job wins)."""
+    bad = sorted(set(job_fragment) - _JOB_KEYS)
+    if bad:
+        raise SkySpecError(
+            f"sky.yaml may only set {sorted(_JOB_KEYS)}; not allowed: {bad}")
+    return _deep_merge(defaults, job_fragment)
+
+
+def _acc_name(acc) -> Optional[str]:
+    """Name of a single-accelerator spec (string or one-key dict), else None."""
+    if isinstance(acc, str):
+        return acc.split(":", 1)[0]
+    if isinstance(acc, dict) and len(acc) == 1:
+        return str(next(iter(acc)))
+    return None
+
+
+def accelerator_of(task: dict) -> Optional[str]:
+    """The single pinned accelerator name, or None (no GPU / not single)."""
+    return _acc_name((task.get("resources") or {}).get("accelerators"))
+
+
+def _containers(task: dict) -> Optional[list]:
+    try:
+        c = task["config"]["kubernetes"]["pod_config"]["spec"]["containers"]
+    except (KeyError, TypeError):
+        return None
+    return c if isinstance(c, list) and c else None
+
+
+def gpumem_of(task: dict) -> Optional[int]:
+    """The nvidia.com/gpumem limit of container 0, or None."""
+    c = _containers(task)
+    try:
+        v = c[0]["resources"]["limits"][_GPUMEM_KEY]
+    except (KeyError, TypeError):
+        return None
+    return int(v)
+
+
+def _set_gpumem(task: dict, value: int) -> None:
+    node = task
+    for key in ("config", "kubernetes", "pod_config", "spec"):
+        node = node.setdefault(key, {})
+    containers = node.setdefault("containers", [])
+    if not containers:
+        containers.append({})
+    limits = containers[0].setdefault("resources", {}).setdefault("limits", {})
+    limits[_GPUMEM_KEY] = value
+
+
+def _has_gpu(res: dict) -> bool:
+    return bool(res.get("accelerators"))
+
+
+def validate_and_fill(task: dict, *, whole_card: bool, allow_high: bool,
+                      infra_override: Optional[str]) -> dict:
+    """Check the placement rules; return a new task with gpumem/infra filled."""
+    task = copy.deepcopy(task)
+    if task.get("resources") is None:
+        task["resources"] = {}
+    res = task["resources"]
+
+    if "config" in res:
+        raise SkySpecError("resources.config: must be top-level (use `config:`)")
+    if task.get("num_nodes", 1) != 1:
+        raise SkySpecError("num_nodes must be 1")
+
+    gpu_in_choices = any(
+        _has_gpu(r) for key in ("any_of", "ordered") for r in (res.get(key) or []))
+    acc = res.get("accelerators")
+    if gpu_in_choices or isinstance(acc, (list, set, tuple, frozenset)) or (
+            acc and _acc_name(acc) is None):
+        raise SkySpecError("GPU jobs must pin exactly one accelerator")
+
+    name = _acc_name(acc) if acc else None
+    if name in HAMI_GPUMEM:
+        slot, card = HAMI_GPUMEM[name]
+        mem = gpumem_of(task)
+        if mem is None:
+            if not whole_card:
+                raise SkySpecError(
+                    f"{name} needs a nvidia.com/gpumem cap: one slot is {slot} MiB, "
+                    f"whole card is {card} MiB (pass --whole-card for the whole card)")
+            _set_gpumem(task, card)
+        elif mem > card:
+            raise SkySpecError(
+                f"gpumem {mem} exceeds the whole-card value {card} MiB for {name}")
+
+    try:
+        prio = task["config"]["kubernetes"]["pod_config"]["spec"].get("priorityClassName")
+    except (KeyError, TypeError, AttributeError):
+        prio = None
+    if prio is not None:
+        if prio not in _PRIORITY_CLASSES:
+            raise SkySpecError(
+                f"priority class {prio!r} not allowed; use one of {list(_PRIORITY_CLASSES)}")
+        if prio == "high" and not allow_high:
+            raise SkySpecError("priority class 'high' requires --allow-high")
+
+    for mount, vol in (task.get("volumes") or {}).items():
+        if str(vol).startswith("do-"):
+            raise SkySpecError(
+                f"DO has no persistent volume: {mount} uses {vol!r}")
+
+    if infra_override:
+        current = res.get("infra")
+        if current and current != infra_override:
+            raise SkySpecError(
+                f"--infra contradicts sky.yaml: {infra_override!r} vs {current!r}")
+        res["infra"] = infra_override
+    return task
