@@ -1,3 +1,4 @@
+import copy
 import sys
 from pathlib import Path
 
@@ -216,3 +217,73 @@ def test_launch_decision_table():
 
 def test_files_complete_key():
     assert lib.S3Layout("r3").files_complete("J") == "r3/jobs/J/files.complete"
+
+
+# --- render_task -------------------------------------------------------------
+
+RCFG = {"bucket": "bk", "prefix": "r3", "sync_interval": 300,
+        "endpoint": "https://s3.ext", "endpoint_internal": "http://s3.int"}
+
+
+def _render(**kw):
+    args = dict(name="n", job_id="ID", task={"resources": {"cpus": 2}}, deps=["D1"], git=[],
+                sky_cfg=RCFG, r3_ref="a65b646", bootstrap_text="echo boot",
+                secret_names=["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"])
+    args.update(kw)
+    return lib.render_task(**args)
+
+
+def test_render_task_owns_name_setup_run_and_never_embeds_secret_values():
+    t = lib.render_task(name="federico-r3-0f3c9a7e", job_id="ID", task={"resources": {"cpus": 2}},
+                        deps=["D1"], git=[], sky_cfg=RCFG, r3_ref="a65b646",
+                        bootstrap_text="echo boot", secret_names=["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"])
+    assert t["name"] == "federico-r3-0f3c9a7e"
+    assert t["envs"]["R3_JOB_ID"] == "ID" and t["envs"]["XR3SKY_DEPS"] == "D1"
+    assert t["secrets"] == {"AWS_ACCESS_KEY_ID": None, "AWS_SECRET_ACCESS_KEY": None}
+    assert "a65b646" in t["setup"] and t["run"] == "echo boot"
+    assert t["resources"] == {"cpus": 2}
+
+
+def test_render_task_envs_exact_and_strings():
+    t = _render(deps=["D1", "D2"], git=[("abc", "git/foo", "c0ffee"), ("def", "git/bar", "beef")])
+    assert t["envs"] == {
+        "R3_JOB_ID": "ID", "XR3SKY_BUCKET": "bk", "XR3SKY_PREFIX": "r3",
+        "XR3SKY_DEPS": "D1 D2", "XR3SKY_GIT": "abc:git/foo:c0ffee def:git/bar:beef",
+        "XR3SKY_SYNC_INTERVAL": "300", "XR3SKY_ENDPOINT": "https://s3.ext",
+        "XR3SKY_ENDPOINT_INTERNAL": "http://s3.int"}
+    assert all(isinstance(v, str) for v in t["envs"].values())
+
+
+def test_render_task_fragment_envs_kept_and_overridden():
+    t = _render(task={"envs": {"FOO": "1", "XR3SKY_BUCKET": "evil", "R3_JOB_ID": "x"}})
+    assert t["envs"]["FOO"] == "1"
+    assert t["envs"]["XR3SKY_BUCKET"] == "bk" and t["envs"]["R3_JOB_ID"] == "ID"
+
+
+def test_render_task_secrets_merge_dedupe_order():
+    t = _render(task={"secrets": {"HF_TOKEN": None, "AWS_ACCESS_KEY_ID": None}},
+                secret_names=["WANDB", "HF_TOKEN"])
+    assert list(t["secrets"]) == ["WANDB", "HF_TOKEN", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+    assert all(v is None for v in t["secrets"].values())
+
+
+def test_render_task_setup_idempotent_snippet():
+    s = _render()["setup"]
+    assert "command -v uv ||" in s and "astral.sh/uv/install.sh" in s
+    assert 'uv tool install "r3 @ git+https://github.com/mtangemann/r3@a65b646"' in s
+    assert "uv tool install awscli" in s
+    assert "UV_CACHE_DIR=$HOME/.cache/uv" in s and ".local/bin" in s
+
+
+def test_render_task_does_not_mutate_inputs_and_keeps_keys():
+    task = {"resources": {"cpus": 2}, "config": {"a": 1}, "volumes": {"/m": "v"}, "num_nodes": 2,
+            "envs": {"FOO": "1"}, "secrets": {"S": None}}
+    snap = copy.deepcopy(task)
+    names, deps, git = ["X"], ["D"], [("a", "git/b", "c")]
+    sn = (list(names), list(deps), list(git))
+    t = _render(task=task, secret_names=names, deps=deps, git=git)
+    assert task == snap and (names, deps, git) == sn
+    for k in ("resources", "config", "volumes", "num_nodes"):
+        assert t[k] == task[k]
+    t["envs"]["Z"] = "1"; t["resources"]["cpus"] = 9
+    assert "Z" not in task["envs"] and task["resources"]["cpus"] == 2

@@ -18,6 +18,7 @@
 # before that point cannot clobber remote state. Bash 3.2 compatible. Never `set -x`:
 # the environment carries credentials.
 set -euo pipefail
+export PATH="$HOME/.local/bin:$PATH"  # uv tool installs (r3, aws) live here
 
 log() { echo "[xr3sky] $*" >&2; }
 die() { log "ERROR: $*"; exit 1; }

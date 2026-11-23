@@ -256,3 +256,42 @@ def validate_and_fill(task: dict, *, whole_card: bool, allow_high: bool,
                 f"--infra contradicts sky.yaml: {infra_override!r} vs {current!r}")
         res["infra"] = infra_override
     return task
+
+
+# --- task rendering ----------------------------------------------------------
+
+_SETUP_TEMPLATE = """\
+set -e
+export PATH="$HOME/.local/bin:$PATH"
+command -v uv || curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+export UV_CACHE_DIR=$HOME/.cache/uv
+uv tool install "r3 @ git+https://github.com/mtangemann/r3@{r3_ref}"
+uv tool install awscli
+"""
+
+
+def render_task(*, name: str, job_id: str, task: dict, deps: list,
+                git: list, sky_cfg: Mapping, r3_ref: str,
+                bootstrap_text: str, secret_names: list) -> dict:
+    """Full SkyPilot task dict from a validated fragment. Inputs are not mutated."""
+    out = copy.deepcopy(task)
+    envs = {str(k): str(v) for k, v in (out.get("envs") or {}).items()}
+    envs.update({
+        "R3_JOB_ID": job_id,
+        "XR3SKY_BUCKET": str(sky_cfg["bucket"]),
+        "XR3SKY_PREFIX": str(sky_cfg["prefix"]),
+        "XR3SKY_DEPS": " ".join(deps),
+        "XR3SKY_GIT": " ".join(f"{s}:{p}:{c}" for s, p, c in git),
+        "XR3SKY_SYNC_INTERVAL": str(sky_cfg["sync_interval"]),
+        "XR3SKY_ENDPOINT": str(sky_cfg["endpoint"]),
+        "XR3SKY_ENDPOINT_INTERNAL": str(sky_cfg["endpoint_internal"]),
+    })
+    names = list(secret_names) + list(out.get("secrets") or {}) + [
+        "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+    out["name"] = name
+    out["envs"] = envs
+    out["secrets"] = {n: None for n in dict.fromkeys(names)}
+    out["setup"] = _SETUP_TEMPLATE.format(r3_ref=r3_ref)
+    out["run"] = bootstrap_text
+    return out
