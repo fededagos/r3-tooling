@@ -51,6 +51,18 @@ def job_id_prefix_from_name(name: str, user: str) -> Optional[str]:
 
 # --- S3 key layout -----------------------------------------------------------
 
+def validate_prefix(prefix) -> str:
+    """Check `sky.prefix`: a non-empty key prefix with no leading/trailing `/`,
+    no empty segment and no `..` segment. Returns it; raises ValueError."""
+    if not isinstance(prefix, str) or not prefix:
+        raise ValueError(f"sky.prefix must be a non-empty string, got {prefix!r}")
+    if prefix.startswith("/") or prefix.endswith("/"):
+        raise ValueError(f"sky.prefix must not start or end with '/': {prefix!r}")
+    if any(part in ("", "..") for part in prefix.split("/")):
+        raise ValueError(f"sky.prefix must not contain '..' or '//': {prefix!r}")
+    return prefix
+
+
 @dataclass(frozen=True)
 class S3Layout:
     prefix: str
@@ -149,6 +161,10 @@ def merge_task(defaults: dict, job_fragment: dict) -> dict:
     if bad:
         raise SkySpecError(
             f"sky.yaml may only set {sorted(_JOB_KEYS)}; not allowed: {bad}")
+    secrets = job_fragment.get("secrets")
+    if isinstance(secrets, dict) and any(v is not None for v in secrets.values()):
+        # sky.yaml is a committed job file and is pushed to S3: never a value.
+        raise SkySpecError("secrets in sky.yaml must be names only (null values)")
     return _deep_merge(defaults, job_fragment)
 
 
@@ -220,6 +236,8 @@ def validate_and_fill(task: dict, *, whole_card: bool, allow_high: bool,
         raise SkySpecError("GPU jobs must pin exactly one accelerator")
 
     name = _acc_name(acc) if acc else None
+    # Accelerator names are case-insensitive; use the table's canonical key.
+    name = next((k for k in HAMI_GPUMEM if name and k.upper() == name.upper()), name)
     if name in HAMI_GPUMEM:
         slot, card = HAMI_GPUMEM[name]
         mem = gpumem_of(task)
@@ -251,7 +269,10 @@ def validate_and_fill(task: dict, *, whole_card: bool, allow_high: bool,
 
     if infra_override:
         current = res.get("infra")
-        if current and current != infra_override:
+        # --infra may only narrow: equal to sky.yaml's infra, or below it
+        # (`k8s` -> `k8s/at-cluster`).
+        if current and current != infra_override and not str(
+                infra_override).startswith(str(current).rstrip("/") + "/"):
             raise SkySpecError(
                 f"--infra contradicts sky.yaml: {infra_override!r} vs {current!r}")
         res["infra"] = infra_override

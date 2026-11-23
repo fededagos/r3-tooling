@@ -26,7 +26,8 @@ Check all three before `launch`; each failure has a one-line message:
 - **`sky-up`** run, for the SkyPilot API (`launch`, `logs`, `cancel`; `status` degrades
   without it and shows `?` for the managed state).
   Message: `SkyPilot API unreachable — run sky-up`.
-- **`R3_REPOSITORY`** set. Also `sky.user` in `~/.config/xr3.yaml` or `$SKYPILOT_USER`.
+- **`R3_REPOSITORY`** set. Also `sky.user` in `~/.config/xr3.yaml` or `$SKYPILOT_USER`
+  (`sky.user` wins; foreman uses the same order).
 
 The VPN and the Teleport tunnel coexist. Ask the human to connect the VPN; you cannot.
 
@@ -41,8 +42,10 @@ xr3-sky pull <id>              # after it finishes: S3 -> $R3_REPOSITORY/jobs/<i
 ```
 
 Select many jobs with `--tag`/`--query` on `launch` and `pull`, as with `xr3-slurm submit`.
-`cancel <id>` stops the newest managed job for that id. A job is done when `status` shows
-`completed` in the `done` column; `pull` then copies it. Always `--dry` first for a job
+`cancel <id>` prints and stops the newest managed job for that id. A job is done when
+`status` shows `completed` in the `done` column; `pull` copies it once the pod has also
+written `output.complete`, skips a job being rerun (`restart`), and copies a `failed` job
+as it is, for its logs and partial output. Always `--dry` first for a job
 whose `sky.yaml` you just wrote.
 
 The job must be launchable: committed, with the house `run.sh`, and an environment from
@@ -58,13 +61,15 @@ with the job, so changing them means a new commit. Keys: `resources`, `config`, 
 
 - a GPU job that does not pin **exactly one accelerator** (`accelerators: L40S:1`, not a
   list or `any_of`). The accelerator pins the cluster. CPU-only jobs may float, and
-  `--infra k8s/<cluster>` narrows them.
-- a HAMi-shared card (`RTXPRO6000`, `H100-80GB`, `L40S`) with no `nvidia.com/gpumem` cap
+  `--infra k8s/<cluster>` (e.g. `k8s/at-cluster`) narrows them; `--infra` may also narrow
+  a `sky.yaml` infra it extends (`k8s` → `k8s/at-cluster`), never contradict it.
+- a HAMi-shared card (`RTXPRO6000`, `H100-80GB`, `L40S`, any case) with no `nvidia.com/gpumem` cap
   under top-level `config.kubernetes.pod_config.spec.containers[0].resources.limits`.
   Request the slots the job needs. `--whole-card` books the whole card: use it only when
   the job really needs the whole card.
 - `priorityClassName: high` without `--allow-high`. High preempts colleagues: ask the
   human, who asks the lab, before passing it.
+- a `secrets:` entry with a value (`sky.yaml` is pushed to S3): names only, `{NAME: null}`.
 
 ## Done state
 
@@ -79,6 +84,8 @@ The S3 copy of `output/done` decides; the local copy counts only when S3 has non
 - A relaunch **keeps partial output**: the pod restores `output/` from S3 first, so a
   checkpointing job resumes.
 - `--fresh` deletes the S3 output first. It destroys results: confirm with the human.
+- Any marker body but `restart`/`failed` (an empty file included) is completed, on the
+  laptop and in the pod alike.
 - The pod writes `failed` when `run.sh` exits non-zero, **including infrastructure
   failures** (an S3 hiccup, a failed `uv sync` download). Read `logs`; if the cause was
   transient, `launch -r`; if it was the job, fix it and commit a new version.
@@ -92,8 +99,10 @@ The S3 copy of `output/done` decides; the local copy counts only when S3 has non
 
 `pull` leaves files over `--max-size` (default 100MB) in S3 and lists them in
 `output/REMOTE.yaml` (path, size, etag, `s3://` uri). `pull --all` fetches everything. A
-downstream `xr3-sky` job gets the full output from S3 anyway; a downstream job run
-elsewhere needs `pull --all` first.
+downstream `xr3-sky` job gets the full output from S3 anyway (`launch` checks that S3 has
+it); a downstream job run elsewhere needs `pull --all` first. A dependency pushed with
+`--allow-unfinished-deps` gets no `output.complete` and is re-uploaded on every launch;
+`launch --repush-deps` re-uploads finished dependencies' local output on purpose.
 
 ## Pointer jobs
 
@@ -114,9 +123,11 @@ anything long-lived. Template: `examples/pointer-job/`.
 | `depends on a container/venv environment job <dep>` | Move the job to a uv lockfile (`examples/uv-job/`). |
 | `dependency <dep> has no output locally or in S3` | Run or `pull` the dependency first. |
 | `dependency <dep> is unfinished (no output/done); …` | Finish it; `--allow-unfinished-deps` only on purpose. |
+| `dependency <dep> has REMOTE.yaml but no complete output in S3` | S3 lost the full output: relaunch the dependency. |
+| `secrets in sky.yaml must be names only (null values)` | `secrets: {NAME: null}`; export the value. |
 | `already queued/running as managed job N (…)` | Wait or `cancel`; `--force-duplicate` only on purpose. |
 | `secret(s) not set in the environment: NAME` | Export the secret the job's `sky.yaml` lists. |
-| `<id>: in progress (no done marker in S3), skipping` | Not finished: check `status`, pull later. |
+| `<id>: in progress (no done marker in S3)` / `(restart)` / `in progress, skipping` | Not finished: check `status`, pull later. |
 | `No run script in <dir>.` | Pointer/raw-data jobs are not launchable; others need the house `run.sh`. |
 
 Everything else: the troubleshooting table in `extensions/xr3-sky/README.md`.

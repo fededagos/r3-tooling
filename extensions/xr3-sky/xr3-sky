@@ -43,7 +43,12 @@ def _config() -> dict:
 
 
 def _sky_config() -> dict:
-    return _config()["sky"]
+    cfg = _config()["sky"]
+    try:
+        lib.validate_prefix(cfg.get("prefix"))
+    except ValueError as e:
+        raise click.ClickException(str(e))
+    return cfg
 
 
 def _store(cfg: dict) -> s3.Store:
@@ -361,7 +366,8 @@ def _secret_env(names, profile: Optional[str]) -> dict:
 
 def _launch_job(path: Path, repo, store, sky_cfg: dict, layout: lib.S3Layout, *,
                 dry: bool, infra: Optional[str], whole_card: bool, allow_high: bool,
-                restart_failed: bool, fresh: bool, allow_unfinished: bool, yes: bool,
+                restart_failed: bool, fresh: bool, allow_unfinished: bool,
+                repush_deps: bool, yes: bool,
                 user: str, r3_ref: str, verbose: int, managed_jobs,
                 force_duplicate: bool) -> bool:
     path = path.absolute()
@@ -401,7 +407,8 @@ def _launch_job(path: Path, repo, store, sky_cfg: dict, layout: lib.S3Layout, *,
 
     deps, git_deps = _deps_closure(repo, job)
     try:
-        plan = s3.plan_push(job_id, path, deps, git_deps, store, layout, allow_unfinished)
+        plan = s3.plan_push(job_id, path, deps, git_deps, store, layout, allow_unfinished,
+                            repush_deps=repush_deps)
     except s3.PushError as e:
         raise click.ClickException(f"{job_id}: {e}")
 
@@ -525,20 +532,23 @@ def cli():
 @click.option("-q", "--query", "queries", multiple=True, type=str,
               help="Select jobs by a JSON query fragment (repeatable).")
 @click.option("--dry", is_flag=True, help="Print the task YAML and upload plan; write nothing.")
-@click.option("--infra", default=None, help="SkyPilot infra (e.g. k8s/at).")
+@click.option("--infra", default=None,
+              help="SkyPilot infra (e.g. k8s/at-cluster); may only narrow sky.yaml's.")
 @click.option("--whole-card", is_flag=True, help="Fill gpumem with the whole card.")
 @click.option("--allow-high", is_flag=True, help="Allow priority class 'high'.")
 @click.option("-r", "--restart-failed", is_flag=True, help="Relaunch jobs marked failed.")
 @click.option("--fresh", is_flag=True, help="Delete the job's S3 output before launching.")
 @click.option("--allow-unfinished-deps", is_flag=True,
-              help="Push dependencies that have no output/done.")
+              help="Push dependencies that have no output/done (re-uploaded every launch).")
+@click.option("--repush-deps", is_flag=True,
+              help="Upload dependency outputs again even if complete in S3.")
 @click.option("--yes", is_flag=True, help="Do not ask before large pushes.")
 @click.option("--force-duplicate", is_flag=True,
               help="Launch even if a managed job with the same name is queued/running.")
 @click.option("-v", "--verbose", count=True, help="Increase verbosity (repeatable).")
 @_vpn_hint
 def launch(job_ids, tags, queries, dry, infra, whole_card, allow_high, restart_failed,
-           fresh, allow_unfinished_deps, yes, force_duplicate, verbose):
+           fresh, allow_unfinished_deps, repush_deps, yes, force_duplicate, verbose):
     """Launch jobs on SkyPilot, selected by JOB_IDS and/or --tag/--query."""
     sky_cfg = _sky_config()
     store = _store(sky_cfg)
@@ -558,7 +568,8 @@ def launch(job_ids, tags, queries, dry, infra, whole_card, allow_high, restart_f
         _launch_job(path, repository, store, sky_cfg, layout, dry=dry, infra=infra,
                     whole_card=whole_card, allow_high=allow_high,
                     restart_failed=restart_failed, fresh=fresh,
-                    allow_unfinished=allow_unfinished_deps, yes=yes, user=user,
+                    allow_unfinished=allow_unfinished_deps, repush_deps=repush_deps,
+                    yes=yes, user=user,
                     r3_ref=r3_ref, verbose=verbose,
                     managed_jobs=managed_jobs,
                     force_duplicate=force_duplicate)
@@ -583,25 +594,60 @@ def _make_writable(path: Path) -> None:
 
 
 def _up_to_date(obj: s3.ObjectInfo, dest: Path) -> bool:
-    """Local file matches the remote object by size and, for plain-md5 etags, content."""
+    """Local file matches the remote object: same size and, for a plain-MD5 etag,
+    same content; for any other etag (multipart uploads, e.g. `aws s3 sync` above
+    8 MB) the same mtime, which pull sets to the object's LastModified."""
     if not dest.is_file() or dest.stat().st_size != obj.size:
         return False
     etag = (obj.etag or "").strip('"')
-    if "-" in etag or not etag:  # multipart etag: not an md5, size match is all we have
+    if etag and "-" not in etag:
+        return _md5(dest) == etag
+    if obj.last_modified is None:  # nothing else to compare: size match is all we have
         return True
-    return _md5(dest) == etag
+    return abs(dest.stat().st_mtime - obj.last_modified) < 1.0
+
+
+def _download(store, obj: s3.ObjectInfo, out: Path, rel: str) -> None:
+    """Download one object to out/rel (dirs made writable / created); the local
+    mtime becomes the object's LastModified, for the next pull's up-to-date check."""
+    dest = out / rel
+    d = out
+    for part in Path(rel).parts[:-1]:
+        d = d / part
+        if d.exists():
+            _make_writable(d)
+        else:
+            d.mkdir()
+    if dest.exists():
+        _make_writable(dest)
+    store.download_file(obj.key, dest)
+    if obj.last_modified is not None:
+        os.utime(dest, (obj.last_modified, obj.last_modified))
 
 
 def _pull_job(job_id: str, repo_path: Path, store, layout: lib.S3Layout, bucket: str,
               max_bytes: Optional[int]) -> None:
     prefix = layout.output(job_id)
+    # The done state comes first, and decides whether to pull at all: the listing
+    # below then never predates it, so a job finishing meanwhile cannot leave a
+    # local done marker with files missing.
+    done_text = store.read_text(layout.done(job_id))
+    if done_text is None:
+        if not store.list(prefix):
+            print(f"no S3 output for {job_id}")
+        else:
+            print(f"{job_id}: in progress (no done marker in S3), skipping")
+        return
+    state = lib.effective_done(done_text, None)
+    if state == "restart":
+        print(f"{job_id}: in progress (restart), skipping")
+        return
+    # completed: only once the pod has certified the output (final sync done);
+    # failed: pullable as it is, to inspect the partial output.
+    if state == "completed" and not store.exists(layout.complete(job_id)):
+        print(f"{job_id}: in progress, skipping")
+        return
     objects = store.list(prefix)
-    if not objects:
-        print(f"no S3 output for {job_id}")
-        return
-    if store.read_text(layout.done(job_id)) is None:
-        print(f"{job_id}: in progress (no done marker in S3), skipping")
-        return
     download, remote = s3.split_for_pull(objects, max_bytes)
     out = repo_path / "jobs" / job_id / "output"
     # r3 only write-protects the job dir, r3.yaml and the job files, never output/;
@@ -611,13 +657,13 @@ def _pull_job(job_id: str, repo_path: Path, store, layout: lib.S3Layout, bucket:
     downloaded = skipped = 0
     out_real = out.resolve()
     done_key = layout.done(job_id)
-    # `done` goes last: an interrupted pull must never leave a local done marker
-    # with files missing.
-    ordered = [o for o in download if o.key != done_key] + \
-              [o for o in download if o.key == done_key]
-    for obj in ordered:
+    done_obj = None
+    for obj in download:
         rel = obj.key[len(prefix):]
         if not rel or rel.endswith("/") or rel == "REMOTE.yaml":
+            continue
+        if obj.key == done_key:
+            done_obj = obj
             continue
         parts = Path(rel).parts
         dest = out / rel
@@ -628,17 +674,10 @@ def _pull_job(job_id: str, repo_path: Path, store, layout: lib.S3Layout, bucket:
         if _up_to_date(obj, dest):
             skipped += 1
             continue
-        d = out
-        for part in parts[:-1]:
-            d = d / part
-            if d.exists():
-                _make_writable(d)
-            else:
-                d.mkdir()
-        if dest.exists():
-            _make_writable(dest)
-        store.download_file(obj.key, dest)
+        _download(store, obj, out, rel)
         downloaded += 1
+    # REMOTE.yaml, then `done` last: an interrupted pull must never leave a local
+    # done marker with files, or the listing of what stayed in S3, missing.
     ry = out / "REMOTE.yaml"
     if remote:
         if ry.exists():
@@ -646,6 +685,12 @@ def _pull_job(job_id: str, repo_path: Path, store, layout: lib.S3Layout, bucket:
         ry.write_text(s3.remote_yaml(remote, bucket, prefix))
     elif ry.exists():
         ry.unlink()
+    if done_obj is not None:
+        if _up_to_date(done_obj, out / "done"):
+            skipped += 1
+        else:
+            _download(store, done_obj, out, "done")
+            downloaded += 1
     print(f"{job_id}: downloaded {downloaded}, skipped {skipped} up-to-date, "
           f"{len(remote)} remote ({_fmt_bytes(sum(o.size for o in remote))})")
 
@@ -704,11 +749,13 @@ def _sky_user() -> str:
         raise click.ClickException(str(e))
 
 
-def _sky_passthrough(verb_args: list, job_id: str) -> None:
+def _sky_passthrough(verb_args: list, job_id: str, announce: Optional[str] = None) -> None:
     name = lib.managed_job_name(_sky_user(), job_id)
     job = _newest_managed_job(name)
     if job is None:
         raise click.ClickException(f"no managed job named {name}")
+    if announce:
+        print(f"{announce} managed job {job['job_id']} ({name})", flush=True)
     argv = [_sky_bin(), "jobs", *verb_args, str(job["job_id"])]
     sys.exit(subprocess.run(argv).returncode)  # stream: no capture
 
@@ -725,7 +772,7 @@ def logs(job_id, controller):
 @click.argument("job_id")
 def cancel(job_id):
     """Cancel the newest managed job for JOB_ID."""
-    _sky_passthrough(["cancel", "-y"], job_id)
+    _sky_passthrough(["cancel", "-y"], job_id, announce="cancelling")
 
 
 @cli.command()

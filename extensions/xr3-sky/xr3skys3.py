@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Protocol
@@ -37,6 +38,9 @@ class ObjectInfo:
     key: str
     size: int
     etag: str
+    # S3 LastModified as epoch seconds (None if unknown). Needed for multipart
+    # objects, whose etag is not an MD5 of the content.
+    last_modified: Optional[float] = None
 
 
 class Store(Protocol):
@@ -49,17 +53,44 @@ class Store(Protocol):
     def delete_prefix(self, prefix: str) -> int: ...
 
 
-class MemoryStore:
-    """Dict-backed Store for tests; byte-faithful, etag is md5 hex."""
+class _Objects(dict):
+    """key -> bytes; every assignment stamps `last_modified[key]` with the time."""
 
-    def __init__(self) -> None:
-        self.objects: dict[str, bytes] = {}
+    def __init__(self, last_modified: dict) -> None:
+        super().__init__()
+        self.last_modified = last_modified
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self.last_modified[key] = time.time()
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        self.last_modified.pop(key, None)
+
+
+class MemoryStore:
+    """Dict-backed Store for tests; byte-faithful, etag is md5 hex.
+
+    With `multipart_etags`, etags look like multipart uploads (`<hex>-1`, not an
+    MD5 of the content). `last_modified` (key -> epoch) is stamped on every write
+    and may be set by tests."""
+
+    def __init__(self, multipart_etags: bool = False) -> None:
+        self.multipart_etags = multipart_etags
+        self.last_modified: dict[str, float] = {}
+        self.objects: dict[str, bytes] = _Objects(self.last_modified)
+
+    def _etag(self, data: bytes) -> str:
+        if self.multipart_etags:
+            return hashlib.md5(hashlib.md5(data).digest()).hexdigest() + "-1"
+        return hashlib.md5(data).hexdigest()
 
     def exists(self, key):
         return key in self.objects
 
     def list(self, prefix):
-        return [ObjectInfo(k, len(v), hashlib.md5(v).hexdigest())
+        return [ObjectInfo(k, len(v), self._etag(v), self.last_modified.get(k))
                 for k, v in sorted(self.objects.items()) if k.startswith(prefix)]
 
     def read_text(self, key):
@@ -126,19 +157,30 @@ def _unreachable_on_connection_error(method):
     return wrapper
 
 
+def _boto_config(Config):
+    """The client Config. Fail fast when the endpoint is unreachable (VPN down):
+    well under a minute, instead of botocore's default retries x 60 s timeouts.
+    Checksums only when required: botocore >= 1.36 otherwise adds CRC checksum
+    headers to every request (delete_objects included), which Ceph RGW may reject;
+    older botocore does not know the options and does not send the headers."""
+    base = dict(s3={"addressing_style": "path"}, max_pool_connections=32,
+                connect_timeout=10, read_timeout=120,
+                retries={"max_attempts": 3, "mode": "standard"})
+    try:
+        return Config(**base, request_checksum_calculation="when_required",
+                      response_checksum_validation="when_required")
+    except TypeError:
+        return Config(**base)
+
+
 class BotoStore:
     def __init__(self, bucket: str, endpoint: str, profile: Optional[str] = None):
         import boto3
         from botocore.config import Config
         self.bucket = bucket
         session = boto3.Session(profile_name=profile) if profile else boto3.Session()
-        # Fail fast when the endpoint is unreachable (VPN down): well under a minute,
-        # instead of botocore's default retries x 60 s timeouts.
-        self.client = session.client(
-            "s3", endpoint_url=endpoint,
-            config=Config(s3={"addressing_style": "path"}, max_pool_connections=32,
-                          connect_timeout=10, read_timeout=120,
-                          retries={"max_attempts": 3, "mode": "standard"}))
+        self.client = session.client("s3", endpoint_url=endpoint,
+                                     config=_boto_config(Config))
 
     @_unreachable_on_connection_error
     def ping(self) -> None:
@@ -171,7 +213,9 @@ class BotoStore:
         out = []
         for page in self.client.get_paginator("list_objects_v2").paginate(
                 Bucket=self.bucket, Prefix=prefix):
-            out += [ObjectInfo(o["Key"], o["Size"], o["ETag"].strip('"'))
+            out += [ObjectInfo(o["Key"], o["Size"], o["ETag"].strip('"'),
+                               o["LastModified"].timestamp()
+                               if o.get("LastModified") is not None else None)
                     for o in page.get("Contents", [])]
         return out
 
@@ -255,7 +299,15 @@ def _tree(root: Path, exclude_top: Optional[str] = None):
 
 def plan_push(job_id: str, job_dir: Path, deps: list[DepInfo],
               git_deps: list[tuple[str, str]], store: Store, layout: S3Layout,
-              allow_unfinished: bool) -> PushPlan:
+              allow_unfinished: bool, *, repush_deps: bool = False) -> PushPlan:
+    """What `launch` must upload for `job_id` and its dependency closure.
+
+    A dependency's output is skipped when S3 has its output.complete marker, unless
+    `repush_deps` and the dependency has local output (then it is uploaded again;
+    the marker stays). A dependency with a local REMOTE.yaml must already be
+    complete in S3. An unfinished dependency (allow_unfinished) is uploaded without
+    an output.complete marker, so it is uploaded again on every launch.
+    """
     plan = PushPlan([], [], 0, [])
     for d in deps:
         if d.env_marker:
@@ -276,19 +328,27 @@ def plan_push(job_id: str, job_dir: Path, deps: list[DepInfo],
         plan.complete_markers.append(layout.files_complete(d.job_id))
 
     for d in deps:
-        if d.has_remote_yaml or store.exists(layout.complete(d.job_id)):
+        complete = store.exists(layout.complete(d.job_id))
+        has_local = d.local_output is not None and Path(d.local_output).is_dir()
+        if d.has_remote_yaml and not complete:
+            raise PushError(
+                f"dependency {d.job_id} has REMOTE.yaml but no complete output in S3")
+        if complete and not (repush_deps and has_local):
             plan.skipped.append(d.job_id)
             continue
-        if d.local_output is None or not Path(d.local_output).is_dir():
+        if not has_local:
             raise PushError(f"dependency {d.job_id} has no output locally or in S3")
         if not d.local_done:
             msg = f"dependency {d.job_id} is unfinished (no output/done)"
             if not allow_unfinished:
                 raise PushError(msg + "; pass --allow-unfinished-deps to push it anyway")
-            plan.warnings.append(msg)
-        for p, rel in _tree(Path(d.local_output)):
+            plan.warnings.append(
+                msg + "; its output is uploaded on every launch (no output.complete)")
+        # A local REMOTE.yaml only describes what this laptop did not pull.
+        for p, rel in _tree(Path(d.local_output), exclude_top="REMOTE.yaml"):
             plan.uploads.append((p, layout.output(d.job_id) + rel))
-        plan.complete_markers.append(layout.complete(d.job_id))
+        if d.local_done and not complete:
+            plan.complete_markers.append(layout.complete(d.job_id))
 
     for repo, commit in git_deps:
         key = layout.git_bundle(repo, commit)

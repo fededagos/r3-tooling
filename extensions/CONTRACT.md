@@ -93,13 +93,17 @@ outlives it (see [xr3-sky](xr3-sky/README.md)). What that demands of a job and a
   `secrets`, `num_nodes`.** It is merged over `sky.defaults` and validated: a GPU job pins exactly one
   accelerator; a HAMi-shared card (RTXPRO6000, H100-80GB, L40S) has a `nvidia.com/gpumem` cap unless
   `--whole-card`; `config:` is top-level; `num_nodes` is 1; priority `high` needs `--allow-high`.
-  `secrets` holds names only. *Breaks:* `launch` refuses the job before writing anything.
+  `secrets` holds names only (a value is refused: the file is pushed to S3). *Breaks:* `launch`
+  refuses the job before writing anything.
 - **The `output/done` marker, with `failed`.** As for `xr3-slurm`: `run.sh` writes `output/done`
   (`completed`) on success, and `launch` skips finished jobs, reruns `restart`, and reruns `failed` only
   with `--restart-failed` (rewriting the marker to `restart`). In addition the pod **writes `failed`**
-  itself when `run.sh` exits non-zero without a marker, and the S3 copy of the marker wins over the local
-  one. *Breaks:* without the marker every `launch` reruns the job, `pull` treats it as in progress and
-  downloads nothing, and the pod fails a run that exits 0 without `completed`.
+  itself when `run.sh` exits non-zero with no marker (or `restart`), and the S3 copy of the marker wins
+  over the local one. The laptop, the pod, `xr3-slurm` and foreman classify a body alike: `restart`,
+  `failed`, anything else (empty included) is completed. `pull` copies a completed job only once the pod
+  has written `output.complete`, skips one being rerun (`restart`), and copies a `failed` one as it is.
+  *Breaks:* without the marker every `launch` reruns the job, `pull` treats it as in progress and
+  downloads nothing, and the pod fails a run that exits 0 without a completed marker.
 - **Partial output survives a relaunch.** The pod restores `output/` from S3 before `run.sh` starts, so
   resuming from checkpoints is the job's business (and a job that wants a clean slate clears its own
   output, or you pass `--fresh`). *Breaks:* a job that assumes an empty `output/` may mix runs.
@@ -109,13 +113,14 @@ outlives it (see [xr3-sky](xr3-sky/README.md)). What that demands of a job and a
   needs only the Teleport tunnel (`sky-up`).
 - **Dependencies are finished and present.** Every job dependency has output locally (with
   `output/done`) or complete in S3; git dependencies are pinned to a commit present in the local
-  mirror. *Breaks:* `launch` names the dependency and refuses (`--allow-unfinished-deps` pushes an
-  unfinished one on purpose).
+  mirror. A dependency with a local `REMOTE.yaml` must be complete in S3. *Breaks:* `launch` names the
+  dependency and refuses (`--allow-unfinished-deps` pushes an unfinished one on purpose, with no
+  `output.complete`, so it is re-uploaded on every launch; `--repush-deps` re-uploads finished ones).
 - **Secrets travel as names.** Values come from the laptop environment (AWS from the profile) and are
   passed with `sky jobs launch --secret`. *Breaks:* a secret placed in `envs:` or a job file is written
   to S3 in clear text.
-- **Managed jobs are named `<user>-r3-<first 8 chars of the r3 id>`**, with the user from `sky.user` or
-  `$SKYPILOT_USER`. `status`, `logs` and `cancel` find jobs by that name. *Breaks:* a job launched
+- **Managed jobs are named `<user>-r3-<first 8 chars of the r3 id>`**, with the user from `sky.user`,
+  else the local part of `$SKYPILOT_USER` (foreman uses the same order after its own setting). `status`, `logs` and `cancel` find jobs by that name. *Breaks:* a job launched
   another way is invisible to them.
 
 ## For `xr3 diff`

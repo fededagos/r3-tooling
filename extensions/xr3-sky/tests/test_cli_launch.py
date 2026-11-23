@@ -275,3 +275,58 @@ def test_launch_vpn_drop_during_upload_is_clean_error(env):
     assert "S3 unreachable — connect to the Stanford VPN" in r.output
     assert not any(k.endswith(".complete") for k in env["store"].objects)
     assert calls(env["log"]) == []
+
+
+# --- fix wave ---------------------------------------------------------------------
+
+def _spy_uploads(env):
+    uploads = []
+    orig = env["store"].upload_file
+    env["store"].upload_file = lambda p, k: (uploads.append(k), orig(p, k))
+    return uploads
+
+
+def test_launch_unfinished_dep_gets_no_complete_marker_and_is_repushed(env):
+    (env["repo"] / "jobs" / env["base"] / "output" / "done").unlink()
+    r = launch(env["main"], "--yes", "--allow-unfinished-deps")
+    assert r.exit_code == 0, r.output
+    assert "uploaded on every launch" in r.output
+    objs = env["store"].objects
+    assert LAYOUT.complete(env["base"]) not in objs
+    assert objs[LAYOUT.complete(env["mid"])] == b""
+    (env["repo"] / "jobs" / env["base"] / "output" / "b.txt").write_text("base-out-2")
+    uploads = _spy_uploads(env)
+    r = launch(env["main"], "--yes", "--allow-unfinished-deps")
+    assert r.exit_code == 0, r.output
+    assert LAYOUT.output(env["base"]) + "b.txt" in uploads
+    assert objs[LAYOUT.output(env["base"]) + "b.txt"] == b"base-out-2"
+
+
+def test_launch_repush_deps_reuploads_complete_dep_output(env):
+    assert launch(env["main"], "--yes").exit_code == 0
+    uploads = _spy_uploads(env)
+    r = launch(env["main"], "--yes", "--repush-deps")
+    assert r.exit_code == 0, r.output
+    assert LAYOUT.output(env["base"]) + "b.txt" in uploads
+    assert LAYOUT.output(env["mid"]) + "m.txt" in uploads
+    assert not any("/files/" in k for k in uploads)
+
+
+def test_launch_infra_narrows_sky_yaml_prefix(env, tmp_path):
+    repo = r3.Repository(env["repo"])
+    job = _commit(repo, tmp_path / "src_infra", {
+        "run.sh": "echo x\n", "sky.yaml": yaml.safe_dump({"resources": {"infra": "k8s"}})})
+    r = launch(job, "--dry", "--infra", "k8s/at-cluster")
+    assert r.exit_code == 0, r.output
+    assert "infra: k8s/at-cluster" in r.output
+    r = CliRunner().invoke(cli_mod.cli, ["launch", job, "--dry", "--infra", "k8s2"])
+    assert r.exit_code != 0 and "--infra contradicts sky.yaml" in r.output
+
+
+def test_launch_refuses_secret_value_in_sky_yaml(env, tmp_path):
+    repo = r3.Repository(env["repo"])
+    job = _commit(repo, tmp_path / "src_sec", {
+        "run.sh": "echo x\n", "sky.yaml": yaml.safe_dump({"secrets": {"TOK": "v"}})})
+    r = CliRunner().invoke(cli_mod.cli, ["launch", job, "--dry"])
+    assert r.exit_code != 0
+    assert "secrets in sky.yaml must be names only (null values)" in r.output

@@ -74,16 +74,19 @@ inlined into every task as its `run:`. Design: [`docs/specs/2026-11-23-xr3-sky-d
 5. **Config.** `xr3-sky` reads the `sky:` section of `~/.config/xr3.yaml` (`$XR3_CONFIG`
    overrides). Every key has a built-in default, so you only write the ones you change.
    You **must** provide a user name, either `sky.user` or `$SKYPILOT_USER` (its local
-   part before `@` is used), because SkyPilot names must contain it.
+   part before `@` is used), because SkyPilot names must contain it. `sky.user` wins
+   when both are set. foreman resolves the owner of xr3-sky jobs in the same order
+   (its `SKYPILOT_USER` setting first, then `sky.user`, then `$SKYPILOT_USER`, then the
+   OS user), so set `sky.user` if the two would otherwise disagree.
 
    ```yaml
    sky:
      bucket: federico-r3            # your bucket on the RGW
-     prefix: r3                     # key prefix inside the bucket
+     prefix: r3                     # key prefix inside the bucket (no leading/trailing /, no ..)
      endpoint: https://rgw-cold.enigmatic.stanford.edu
      endpoint_internal: null        # opt-in in-cluster endpoint; only if verified to serve the bucket
      aws_profile: enigma
-     user: null                     # null => local part of $SKYPILOT_USER
+     user: null                     # wins over $SKYPILOT_USER; null => its local part
      sync_interval: 300             # seconds between output syncs in the pod
      pull_max_size: 100MB           # pull leaves larger files in S3 (see REMOTE.yaml)
      push_confirm_above: 5GB        # launch asks before pushing more than this
@@ -153,24 +156,34 @@ Steps 1–5 are read-only: a refused spec or push leaves S3 untouched.
 | `-t, --tag TAG` | Select jobs having all these tags (repeatable). |
 | `-q, --query JSON` | Select jobs by a JSON query fragment (repeatable; bare `key: value` is wrapped in `{}`). |
 | `--dry` | Print the upload plan and the rendered `task.yaml`; upload and submit nothing. Needs S3 (VPN) but not the SkyPilot API. |
-| `--infra INFRA` | Narrow placement, e.g. `k8s/at` for a floating CPU job. Refused if `sky.yaml` already sets a different `resources.infra`. |
+| `--infra INFRA` | Narrow placement, e.g. `k8s/at-cluster` for a floating CPU job. Allowed when `sky.yaml` sets no `resources.infra`, the same one, or a `/`-prefix of it (`k8s` → `k8s/at-cluster`); any other value is refused. |
 | `--whole-card` | Fill a missing `nvidia.com/gpumem` cap with the whole-card value. |
 | `--allow-high` | Allow `priorityClassName: high` (ask colleagues first). |
 | `-r, --restart-failed` | Relaunch jobs whose done state is `failed` (rewrites the marker to `restart`). |
 | `--fresh` | Delete the job's S3 `output/` and `output.complete` first, then launch, whatever the done state. |
-| `--allow-unfinished-deps` | Push dependencies that have no `output/done` (with a warning). |
+| `--allow-unfinished-deps` | Push dependencies that have no `output/done` (with a warning). No `output.complete` is written for such a dependency, so its output is uploaded again on every launch until it finishes. |
+| `--repush-deps` | Upload dependency outputs again even if S3 already has their `output.complete` (only dependencies with local output; the marker stays). Use it after changing a finished dependency's output locally. |
 | `--yes` | Do not ask before a push larger than `push_confirm_above`. |
 | `--force-duplicate` | Launch even if a managed job with the same name is queued or running. |
 | `-v, --verbose` | `-v` prints the upload plan; `-vv` also lists every file. |
 
 ### `pull [JOB_IDS]… [--max-size SIZE | --all]`
 
-Downloads `jobs/<id>/output/` from S3 into `$R3_REPOSITORY/jobs/<id>/output/`. It skips
-files that are already identical (size, and the MD5 where the etag is one), writes the
-`done` marker last, and makes `output/` writable as needed. It skips a job with no S3
-output (`no S3 output for <id>`) or one still running (`<id>: in progress (no done marker
-in S3), skipping`). A `failed` job is pulled like any other, so you can read its logs and
-partial output.
+Downloads `jobs/<id>/output/` from S3 into `$R3_REPOSITORY/jobs/<id>/output/`. It first
+reads the S3 `done` marker and pulls only a finished job:
+
+- no S3 output: `no S3 output for <id>`;
+- output but no marker: `<id>: in progress (no done marker in S3), skipping`;
+- `restart` (a rerun is under way): `<id>: in progress (restart), skipping`;
+- completed but no `output.complete` yet (the pod's final sync has not finished):
+  `<id>: in progress, skipping`;
+- `failed`: pulled as it is, so you can read its logs and partial output.
+
+Only then does it list and download. It skips files that are already identical: same
+size, and the same MD5 where the etag is one; for multipart uploads (`aws s3 sync` above
+8 MB, whose etag is not an MD5) the same modification time, as `pull` sets each
+downloaded file's mtime to the object's S3 `LastModified`. It writes `REMOTE.yaml`, then
+the `done` marker last, and makes `output/` writable as needed.
 
 | Flag | Effect |
 |---|---|
@@ -192,6 +205,7 @@ carries on; without `sky-up` it prints `(SkyPilot state unavailable: …)` and s
 
 Resolve the r3 id to the newest managed job named `<user>-r3-<id[:8]>`, then run
 `sky jobs logs [--controller] <managed id>` (streaming) or `sky jobs cancel -y <managed id>`.
+`cancel` first prints `cancelling managed job <managed id> (<name>)`.
 They need `sky-up`, not the VPN. `--controller` shows the jobs controller's log (useful
 when the job never started).
 
@@ -231,7 +245,8 @@ config:                          # top-level, never inside resources
 - **A GPU job pins exactly one accelerator** (`accelerators: NAME[:count]`). Each
   accelerator type lives on one cluster, so this pins the cluster too. A list, or a GPU
   inside `any_of`/`ordered`, is refused. CPU-only jobs may use `any_of` to float.
-- **HAMi-shared cards need a `nvidia.com/gpumem` cap** (MiB). An uncapped job books the
+- **HAMi-shared cards need a `nvidia.com/gpumem` cap** (MiB). Names match
+  case-insensitively (`l40s:1` is `L40S`). An uncapped job books the
   whole card while looking like one slot to everyone else. `--whole-card` fills in the
   whole-card value instead. The known cards:
 
@@ -246,6 +261,8 @@ config:                          # top-level, never inside resources
 - **Priority** is one of `low`/`medium`/`high`; `high` preempts colleagues, so it needs
   `--allow-high` and a word with them first.
 - `config:` must be top-level, `num_nodes` must be 1.
+- `secrets:` holds names only (`{NAME: null}`): `sky.yaml` is pushed to S3, so a value is
+  refused.
 
 Which GPU to pick, how much VRAM a slot is, and what is free right now are cluster
 questions: see the `enigma-skypilot` skill.
@@ -269,7 +286,8 @@ file) is `completed`.
   deletes the S3 `output/` and `output.complete`, and renames a local `output/done` to
   `output/done.pre-fresh` (other local files stay until the next `pull` overwrites them).
 - **Who writes `failed`.** If `run.sh` (or the bootstrap after the restore) exits
-  non-zero and no marker exists, the pod writes `failed` before the final sync. A
+  non-zero and the marker is missing or `restart`, the pod writes `failed` before the
+  final sync. A completed marker (any other body, empty included) is never overwritten. A
   termination signal (preemption, `cancel`) never marks `failed`: SkyPilot recovers a
   preempted job, and the new pod resumes from the last sync.
   A failure in SkyPilot's `setup:` phase (installing uv, r3 or the AWS CLI) happens
@@ -277,7 +295,10 @@ file) is `completed`.
   the done state is unchanged, and a plain `launch` retries. Read
   `xr3-sky logs <id> --controller` to see why.
 - **`output.complete`** is written only after a `completed` job's output is fully in S3.
-  Downstream launches rely on it to skip re-pushing that output.
+  The pod classifies `done` exactly like the laptop, so an empty marker counts. `launch`
+  writes it for a pushed dependency only if that dependency is finished locally.
+  Downstream launches rely on it to skip re-pushing that output (`--repush-deps`
+  overrides), and `pull` waits for it.
 
 ## What happens in the pod
 
@@ -296,7 +317,8 @@ file) is `completed`.
    the job out to a temp dir and runs `run_inner.sh`, which does `uv sync --frozen` /
    `uv run`;
 6. on any exit: stop the sync loop, mark `failed` if appropriate, do a final sync (3
-   tries), upload `done` last, then `output.complete` for a `completed` job. The pod exits
+   tries), upload `done` last, then `output.complete` for a completed job (any `done`
+   body but `restart`/`failed`). The pod exits
    with `run.sh`'s status.
 
 Pod log lines are prefixed `[xr3sky]`; read them with `xr3-sky logs <id>`.
@@ -332,6 +354,8 @@ environment of the `xr3-sky` process.
 - A job's `sky.yaml` `secrets:` lists names the job **requires**; a missing one is a hard
   error before anything is written. Write them as names only, e.g.
   `secrets: {SPIRAL_TOKEN: null}`.
+- A value in `sky.yaml` `secrets:` is refused (`secrets in sky.yaml must be names only
+  (null values)`): the file is pushed to S3.
 - Put nothing secret in `envs:`: those values are written into the task and into S3.
 - The pod's bootstrap never traces commands (`set -x`), because its environment carries
   the credentials. Keep it that way in your `run_inner.sh`.
@@ -352,8 +376,9 @@ listed in `output/REMOTE.yaml`, one entry per file:
 (`pull --all`).
 
 - **As a dependency of another `xr3-sky` job:** a local `REMOTE.yaml` means the full
-  output is already in S3, so `launch` pushes nothing for it and the pod gets the
-  complete output.
+  output is in S3, so `launch` pushes nothing for it and the pod gets the complete
+  output. `launch` checks that S3 has the dependency's `output.complete` and refuses
+  otherwise. A local `REMOTE.yaml` is never uploaded.
 - **As a dependency of a job you run elsewhere** (laptop, SLURM): the large files are
   *not* there. Either `xr3-sky pull --all <id>` first, or have the consumer read
   `REMOTE.yaml` and fetch the `uri`s itself.
@@ -374,6 +399,7 @@ r3 job id.
 | `` `sky jobs queue` timed out — run sky-up `` | The tunnel is down or stale: rerun `sky-up`. |
 | `` `sky jobs queue` failed (exit N): … `` / `cannot run `sky jobs queue`: …` / `cannot parse `sky jobs queue -o json` output: …` / `` `sky jobs queue -o json` did not return a list `` | A problem in the `sky` CLI or API itself; run `sky jobs queue` by hand to see it. |
 | `set sky.user or SKYPILOT_USER` | Set `sky.user` in `~/.config/xr3.yaml`, or export `SKYPILOT_USER`. |
+| `sky.prefix must …: '…'` | Fix `sky.prefix`: non-empty, no leading or trailing `/`, no `..` or empty segment. |
 | `boto3 is not installed in this environment — re-run the r3-tooling installer` | Re-run the installer (`update.sh`), or `uv pip install --python ~/r3-toolchain/.venv/bin/python boto3`. |
 | `AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY not set and boto3 is not installed` | As above. |
 | `no AWS credentials in profile 'enigma'` / `AWS profile 'enigma': …` | Add the `[enigma]` key to `~/.aws/credentials` (see Setup). |
@@ -405,7 +431,8 @@ r3 job id.
 | `priority class 'X' not allowed; use one of ['low', 'medium', 'high']` | Fix the `priorityClassName`. |
 | `priority class 'high' requires --allow-high` | Ask colleagues first, then pass `--allow-high`. |
 | `DO has no persistent volume: MOUNT uses 'do-…'` | Remove the volume from `sky.defaults`; DO has none. |
-| `--infra contradicts sky.yaml: 'A' vs 'B'` | `--infra` can only narrow; drop it or change `sky.yaml` (a new commit). |
+| `--infra contradicts sky.yaml: 'A' vs 'B'` | `--infra` can only narrow (same value, or below `sky.yaml`'s: `k8s` → `k8s/at-cluster`); drop it or change `sky.yaml` (a new commit). |
+| `secrets in sky.yaml must be names only (null values)` | Write `secrets: {NAME: null}` and export the value in your environment. |
 
 **Push** (prefixed `<id>: ` where noted)
 
@@ -413,7 +440,8 @@ r3 job id.
 |---|---|
 | `<id>: depends on a container/venv environment job <dep>` | xr3-sky jobs take their environment from `pyproject.toml` + `uv.lock` (see `examples/uv-job/`), not from a container or venv job. |
 | `<id>: dependency <dep> has no output locally or in S3` | Run (or `pull`) the dependency first. |
-| `<id>: dependency <dep> is unfinished (no output/done); pass --allow-unfinished-deps to push it anyway` | Finish the dependency, or pass the flag on purpose (it then prints `WARNING: dependency <dep> is unfinished (no output/done)`). |
+| `<id>: dependency <dep> is unfinished (no output/done); pass --allow-unfinished-deps to push it anyway` | Finish the dependency, or pass the flag on purpose (it then prints `WARNING: dependency <dep> is unfinished (no output/done); its output is uploaded on every launch (no output.complete)`). |
+| `<id>: dependency <dep> has REMOTE.yaml but no complete output in S3` | Your local output is partial and S3 no longer holds the full one (e.g. after `--fresh`): relaunch the dependency, or fetch the files `REMOTE.yaml` lists and delete it so `launch` pushes the local output. |
 | `<id>: broken symlink: <path>` / `<id>: symlinked directory not supported: <path>` | Fix or remove the link in the job or dependency output; file symlinks are uploaded as their target. |
 | `dependency <dep> of <id> not in the repository` | The local repo is missing a job: check `R3_REPOSITORY`. |
 | `unresolved git dependency <repo> in <id>` / `unresolved dependency … in <id>` | Only committed jobs (resolved dependencies) can be launched. |
@@ -429,7 +457,7 @@ r3 job id.
 | Message | Fix |
 |---|---|
 | `no S3 output for <id>` | The job never ran with `xr3-sky`, or never synced yet. |
-| `<id>: in progress (no done marker in S3), skipping` | Wait until it finishes (`xr3-sky status`). |
+| `<id>: in progress (no done marker in S3), skipping` / `<id>: in progress (restart), skipping` / `<id>: in progress, skipping` | Wait until it finishes (`xr3-sky status`). |
 | `WARNING: skipping unsafe S3 key '<key>'` | A key would land outside `output/`; it is skipped on purpose. |
 | `no managed job named <user>-r3-<id8>` | Never launched under this user, or `sky jobs queue` no longer lists it. |
 
@@ -442,7 +470,7 @@ r3 job id.
 | `ERROR: commit <sha> not found in bundle for <repo>` | A bad bundle in S3: delete `git/<digest>/<sha>.bundle` and relaunch with `-r`. |
 | `WARNING: r3 rebuild-index failed; continuing …` | Harmless: checkout does not need the index. |
 | `job failed with exit N; writing output/done = failed` | `run.sh` failed: read the log above it, fix, commit a new version (or `launch -r` if it was transient). |
-| `ERROR: run.sh exited 0 but output/done is '…', not 'completed'` | `run.sh` did not write `completed` (not the house `run.sh`, or its guard skipped the run). |
+| `ERROR: run.sh exited 0 but output/done is '…', not 'completed'` | `run.sh` left no completed marker (`absent`, `restart` or `failed`): not the house `run.sh`, or its guard skipped the run. |
 | `ERROR: final output sync failed; outputs may be missing from S3; output/done not uploaded` | S3 trouble at exit. The periodic syncs may have saved most of it; relaunch. |
 | `bootstrap failed before output/ was restored from S3 (exit N); S3 left untouched` | Setup trouble (S3 credentials or endpoint in the pod); nothing in S3 changed. |
 | `WARNING: output sync skipped some files (aws exit 2)` | Usually a dangling symlink in `output/`; those files are not in S3. |

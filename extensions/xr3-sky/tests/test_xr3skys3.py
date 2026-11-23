@@ -108,10 +108,17 @@ def test_remote_yaml_bad_prefix():
         s3.remote_yaml([s3.ObjectInfo("other/x", 1, "e")], "b", "r3/jobs/J/output/")
 
 
+def _complete(*deps):
+    store = s3.MemoryStore()
+    for d in deps:
+        store.write_text(LAYOUT.complete(d), "")
+    return store
+
+
 def test_plan_push_dep_with_remote_yaml_not_uploaded(tmp_path):
     job = make_job(tmp_path)
     dep = make_dep(tmp_path, has_remote_yaml=True)
-    p = plan(job, [dep], s3.MemoryStore())
+    p = plan(job, [dep], _complete("dep1"))
     assert not any("dep1" in k for _, k in p.uploads)
     assert p.complete_markers == ["r3/jobs/J/files.complete"]
     assert "dep1" in p.skipped
@@ -219,7 +226,7 @@ def test_plan_push_uploads_dep_job_files_except_output(tmp_path):
 def test_plan_push_dep_files_skipped_when_files_complete(tmp_path):
     job = make_job(tmp_path)
     dep = make_dep_with_files(tmp_path, has_remote_yaml=True)
-    store = s3.MemoryStore()
+    store = _complete("dep1")
     store.write_text(LAYOUT.files_complete("dep1"), "")
     p = plan(job, [dep], store)
     assert not any("dep1" in k for _, k in p.uploads)
@@ -229,7 +236,7 @@ def test_plan_push_dep_files_skipped_when_files_complete(tmp_path):
 def test_plan_push_dep_files_pushed_even_if_output_remote(tmp_path):
     job = make_job(tmp_path)
     dep = make_dep_with_files(tmp_path, has_remote_yaml=True)
-    p = plan(job, [dep], s3.MemoryStore())
+    p = plan(job, [dep], _complete("dep1"))
     keys = {k for _, k in p.uploads}
     assert "r3/jobs/dep1/files/r3.yaml" in keys
     assert not any(k.startswith("r3/jobs/dep1/output/") for k in keys)
@@ -370,3 +377,79 @@ def test_boto_client_fails_fast():
     assert cfg.retries == {"total_max_attempts": 4, "mode": "standard"}
     assert cfg.max_pool_connections == 32
     assert cfg.s3 == {"addressing_style": "path"}
+
+
+# --- fix wave ---------------------------------------------------------------------
+
+def test_plan_push_dep_with_remote_yaml_needs_complete_output_in_s3(tmp_path):
+    job = make_job(tmp_path)
+    dep = make_dep(tmp_path, has_remote_yaml=True)
+    with pytest.raises(s3.PushError, match=(
+            "dependency dep1 has REMOTE.yaml but no complete output in S3")):
+        plan(job, [dep], s3.MemoryStore())
+
+
+def test_plan_push_unfinished_dep_gets_no_complete_marker(tmp_path):
+    job = make_job(tmp_path)
+    dep = make_dep(tmp_path, done=False)
+    p = plan(job, [dep], s3.MemoryStore(), allow=True)
+    assert "r3/jobs/dep1/output/r.txt" in {k for _, k in p.uploads}
+    assert LAYOUT.complete("dep1") not in p.complete_markers
+    assert any("every launch" in w for w in p.warnings)
+
+
+def test_plan_push_repush_deps_replans_complete_dep_output(tmp_path):
+    job = make_job(tmp_path)
+    dep = make_dep(tmp_path)
+    store = _complete("dep1")
+    p = s3.plan_push("J", job, [dep], [], store, LAYOUT, False, repush_deps=True)
+    assert "r3/jobs/dep1/output/r.txt" in {k for _, k in p.uploads}
+    assert "dep1" not in p.skipped
+    # the marker is already there; it is not rewritten
+    assert LAYOUT.complete("dep1") not in p.complete_markers
+
+
+def test_plan_push_repush_deps_without_local_output_skips(tmp_path):
+    job = make_job(tmp_path)
+    store = _complete("depR")
+    p = s3.plan_push("J", job, [s3.DepInfo("depR", None, False, False, False)], [],
+                     store, LAYOUT, False, repush_deps=True)
+    assert "depR" in p.skipped and not any("depR" in k for _, k in p.uploads)
+
+
+def test_plan_push_never_uploads_local_remote_yaml(tmp_path):
+    job = make_job(tmp_path)
+    dep = make_dep(tmp_path, has_remote_yaml=True)
+    (dep.local_output / "REMOTE.yaml").write_text("[]\n")
+    p = s3.plan_push("J", job, [dep], [], _complete("dep1"), LAYOUT, False,
+                     repush_deps=True)
+    keys = {k for _, k in p.uploads}
+    assert "r3/jobs/dep1/output/r.txt" in keys
+    assert "r3/jobs/dep1/output/REMOTE.yaml" not in keys
+
+
+def test_memory_store_multipart_etags_and_last_modified():
+    store = s3.MemoryStore(multipart_etags=True)
+    store.write_text("k", "x")
+    (o,) = store.list("")
+    assert o.etag.endswith("-1") and o.last_modified is not None
+    store.last_modified["k"] = 5.0
+    assert store.list("")[0].last_modified == 5.0
+
+
+def test_boto_client_checksums_only_when_required():
+    pytest.importorskip("boto3")
+    store = s3.BotoStore("b", "https://s3.invalid.example", None)
+    cfg = store.client.meta.config
+    assert cfg.request_checksum_calculation == "when_required"
+    assert cfg.response_checksum_validation == "when_required"
+
+
+def test_boto_config_falls_back_on_old_botocore():
+    class OldConfig:
+        def __init__(self, **kw):
+            if "request_checksum_calculation" in kw:
+                raise TypeError("Got unexpected keyword argument")
+            self.kw = kw
+    cfg = s3._boto_config(OldConfig)
+    assert cfg.kw["connect_timeout"] == 10

@@ -306,3 +306,50 @@ def test_render_task_fragment_secret_value_is_dropped():
     t = _render(task=task)
     assert t["secrets"]["WANDB_API_KEY"] is None
     assert "sekrit" not in yaml.safe_dump(t)
+
+
+# --- fix wave: HAMi case, infra narrowing, secrets values, prefix --------------
+
+@pytest.mark.parametrize("acc", ["l40s:1", "h100-80gb:1", {"rtxpro6000": 1}])
+def test_validate_hami_lookup_is_case_insensitive(acc):
+    with pytest.raises(lib.SkySpecError, match="needs a nvidia.com/gpumem cap") as e:
+        _validate({"resources": {"accelerators": acc}})
+    assert str(e.value).split()[0] in lib.HAMI_GPUMEM  # canonical name in the message
+
+
+def test_validate_hami_lowercase_whole_card_fills_canonical_value():
+    t = _validate({"resources": {"accelerators": "l40s:1"}}, whole_card=True)
+    assert lib.gpumem_of(t) == lib.HAMI_GPUMEM["L40S"][1]
+
+
+def test_validate_infra_override_may_narrow_a_prefix():
+    t = _validate({"resources": {"infra": "k8s"}}, infra_override="k8s/at-cluster")
+    assert t["resources"]["infra"] == "k8s/at-cluster"
+
+
+@pytest.mark.parametrize("current, override", [
+    ("k8s/at-cluster", "k8s"),          # broadening, not narrowing
+    ("k8s/at", "k8s/at-cluster"),       # not a /-prefix
+    ("k8s/at-cluster", "k8s/morpho"),
+])
+def test_validate_infra_override_refuses_non_narrowing(current, override):
+    with pytest.raises(lib.SkySpecError, match="--infra contradicts sky.yaml"):
+        _validate({"resources": {"infra": current}}, infra_override=override)
+
+
+def test_merge_refuses_secret_values_in_sky_yaml():
+    with pytest.raises(lib.SkySpecError,
+                       match=r"secrets in sky.yaml must be names only \(null values\)"):
+        lib.merge_task({}, {"secrets": {"A": None, "WANDB_API_KEY": "sekrit"}})
+    assert lib.merge_task({}, {"secrets": {"A": None}}) == {"secrets": {"A": None}}
+
+
+@pytest.mark.parametrize("prefix", ["", "/r3", "r3/", "r3/../x", "..", None, 3])
+def test_validate_prefix_refuses_bad(prefix):
+    with pytest.raises(ValueError, match="sky.prefix"):
+        lib.validate_prefix(prefix)
+
+
+@pytest.mark.parametrize("prefix", ["r3", "a/b", "team.r3"])
+def test_validate_prefix_accepts(prefix):
+    assert lib.validate_prefix(prefix) == prefix
