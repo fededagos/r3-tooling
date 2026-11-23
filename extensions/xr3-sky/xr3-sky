@@ -88,9 +88,51 @@ def _preflight(store, need_sky: bool) -> None:
     except s3.StoreUnreachable:
         raise click.ClickException("S3 unreachable — connect to the Stanford VPN")
     if need_sky:
-        rc = subprocess.run([_sky_bin(), "api", "info"], capture_output=True).returncode
+        try:
+            rc = subprocess.run([_sky_bin(), "api", "info"], capture_output=True,
+                                timeout=30).returncode
+        except subprocess.TimeoutExpired:
+            rc = None
         if rc != 0:
             raise click.ClickException("SkyPilot API unreachable — run sky-up")
+
+
+_FINISHED = ("SUCCEEDED", "CANCELLED")
+
+
+def _is_finished(status: str) -> bool:
+    status = str(status or "").upper()
+    return status in _FINISHED or status.startswith("FAILED")
+
+
+def _managed_jobs(skip_finished: bool) -> list:
+    """Parse `sky jobs queue -o json [--skip-finished]`: a list of dicts with keys
+    job_id, job_name, status, submitted_at, end_at (and more)."""
+    argv = [_sky_bin(), "jobs", "queue", "-o", "json"]
+    if skip_finished:
+        argv.append("--skip-finished")
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        raise click.ClickException("`sky jobs queue` timed out — run sky-up")
+    if r.returncode != 0:
+        raise click.ClickException(
+            f"`sky jobs queue` failed (exit {r.returncode}): {r.stderr.strip()}")
+    try:
+        jobs = json.loads(r.stdout)
+    except json.JSONDecodeError as e:
+        raise click.ClickException(f"cannot parse `sky jobs queue -o json` output: {e}")
+    if not isinstance(jobs, list):
+        raise click.ClickException("`sky jobs queue -o json` did not return a list")
+    return jobs
+
+
+def _active_managed_job(jobs: list, name: str) -> Optional[dict]:
+    """A non-finished managed job with this name, if any."""
+    for j in jobs:
+        if j.get("job_name") == name and not _is_finished(j.get("status")):
+            return j
+    return None
 
 
 def _r3_ref() -> str:
@@ -108,10 +150,12 @@ def _git(repo_dir: Path, *args) -> subprocess.CompletedProcess:
 
 
 def _make_bundle(repo_dir: Path, commit: str, out: Path) -> None:
-    """`git bundle create` with exactly `commit`; via a temporary ref if needed."""
-    if _git(repo_dir, "bundle", "create", str(out), commit).returncode == 0:
-        return
-    ref = f"refs/xr3sky/{commit}"
+    """`git bundle create` with exactly `commit`, via a unique temporary ref.
+
+    (A bundle cannot be made from a bare SHA. The pod only needs the objects:
+    it unbundles and pins the commit by SHA, whatever the ref is named.)
+    """
+    ref = f"refs/xr3sky/{commit}-{os.getpid()}"
     r = _git(repo_dir, "update-ref", ref, commit)
     if r.returncode != 0:
         raise click.ClickException(
@@ -224,16 +268,39 @@ def _print_plan(plan: s3.PushPlan, verbose: int) -> None:
 
 # --- secrets -----------------------------------------------------------------------
 
+def _optional_secrets(names) -> list:
+    """Configured default secrets present in the env; warn about (and drop) the rest."""
+    present = []
+    for n in names:
+        if os.environ.get(n):
+            present.append(n)
+        else:
+            click.echo(f"WARNING: secret {n} (sky.secrets) is not set in the "
+                       "environment; launching without it", err=True)
+    return present
+
+
 def _secret_env(names, profile: Optional[str]) -> dict:
-    """Child env for `sky`: os.environ plus AWS creds from the profile if missing."""
+    """Child env for `sky`: os.environ plus AWS creds from the profile if missing.
+
+    Every name in `names` is required (hard error, before any write).
+    """
     env = dict(os.environ)
     missing_aws = [n for n in _AWS_SECRETS if n in names and not env.get(n)]
     if missing_aws:
-        import boto3
-        creds = boto3.Session(profile_name=profile).get_credentials()
-        if creds is None:
+        try:
+            import boto3
+            import botocore.exceptions as be
+        except ImportError:
+            raise click.ClickException(
+                f"{', '.join(missing_aws)} not set and boto3 is not installed")
+        try:
+            creds = boto3.Session(profile_name=profile).get_credentials()
+            frozen = creds.get_frozen_credentials() if creds is not None else None
+        except be.BotoCoreError as e:
+            raise click.ClickException(f"AWS profile {profile!r}: {e}")
+        if frozen is None:
             raise click.ClickException(f"no AWS credentials in profile {profile!r}")
-        frozen = creds.get_frozen_credentials()
         values = {"AWS_ACCESS_KEY_ID": frozen.access_key,
                   "AWS_SECRET_ACCESS_KEY": frozen.secret_key}
         for n in missing_aws:
@@ -250,7 +317,8 @@ def _secret_env(names, profile: Optional[str]) -> dict:
 def _launch_job(path: Path, repo, store, sky_cfg: dict, layout: lib.S3Layout, *,
                 dry: bool, infra: Optional[str], whole_card: bool, allow_high: bool,
                 restart_failed: bool, fresh: bool, allow_unfinished: bool, yes: bool,
-                user: str, r3_ref: str, verbose: int) -> bool:
+                user: str, r3_ref: str, verbose: int, managed_jobs,
+                force_duplicate: bool) -> bool:
     path = path.absolute()
     if not (path / "run.sh").exists():
         raise click.ClickException(f"No run script in {path}.")
@@ -268,7 +336,8 @@ def _launch_job(path: Path, repo, store, sky_cfg: dict, layout: lib.S3Layout, *,
     state = lib.effective_done(
         store.read_text(layout.done(job_id)),
         local_done.read_text() if local_done.is_file() else None)
-    decision = lib.launch_decision(state, restart_failed)
+    # --fresh reruns from scratch: it bypasses the done state entirely.
+    decision = "launch" if fresh else lib.launch_decision(state, restart_failed)
     if decision == "skip":
         print(f"{job_id}: skipping ({state})")
         return False
@@ -297,11 +366,26 @@ def _launch_job(path: Path, repo, store, sky_cfg: dict, layout: lib.S3Layout, *,
         name=name, job_id=job_id, task=task, deps=[d.job_id for d in deps],
         git=git_triples, sky_cfg=sky_cfg, r3_ref=r3_ref,
         bootstrap_text=_BOOTSTRAP.read_text(),
-        secret_names=list(sky_cfg.get("secrets") or []))
+        secret_names=_optional_secrets(sky_cfg.get("secrets") or []))
     task_yaml = _dump(rendered)
     secret_names = list(rendered["secrets"])
+    env = _secret_env(secret_names, sky_cfg.get("aws_profile"))
+
+    active = None
+    if not force_duplicate:
+        try:
+            active = _active_managed_job(managed_jobs(), name)
+        except click.ClickException as e:
+            if not dry:
+                raise
+            print(f"(could not check the managed-job queue: {e.message})")
+    dup_msg = (f"{job_id}: already queued/running as managed job {active.get('job_id')} "
+               f"({active.get('status')}); pass --force-duplicate to launch anyway"
+               if active else None)
 
     if dry:
+        if dup_msg:
+            print(f"{dup_msg} [would skip]")
         print(f"Would launch {job_id} as {name}"
               + (" (rewriting failed -> restart)" if decision == "launch_rewrite_restart" else "")
               + (" (deleting S3 output first)" if fresh else ""))
@@ -309,6 +393,9 @@ def _launch_job(path: Path, repo, store, sky_cfg: dict, layout: lib.S3Layout, *,
         print("--- task.yaml ---")
         print(task_yaml)
         return True
+    if dup_msg:
+        print(dup_msg)
+        return False
 
     if verbose >= 1:
         _print_plan(plan, verbose)
@@ -317,15 +404,12 @@ def _launch_job(path: Path, repo, store, sky_cfg: dict, layout: lib.S3Layout, *,
         click.confirm(f"{job_id}: push {_fmt_bytes(plan.total_bytes)} to S3?", abort=True)
     for w in plan.warnings:
         print(f"WARNING: {w}")
-    env = _secret_env(secret_names, sky_cfg.get("aws_profile"))
 
-    if decision == "launch_rewrite_restart":
-        store.write_text(layout.done(job_id), "restart\n")
-        if local_done.is_file():
-            local_done.write_text("restart\n")
     if fresh:
         store.delete_prefix(layout.output(job_id))
         store.delete_prefix(layout.complete(job_id))
+        if local_done.is_file():
+            local_done.replace(local_done.with_name("done.pre-fresh"))
 
     bundle_src = {layout.git_bundle(p, c): (p, c) for p, c in git_deps}
     try:
@@ -341,6 +425,10 @@ def _launch_job(path: Path, repo, store, sky_cfg: dict, layout: lib.S3Layout, *,
         raise
     except Exception as e:
         raise click.ClickException(f"{job_id}: upload failed, nothing submitted: {e}")
+    if decision == "launch_rewrite_restart":
+        store.write_text(layout.done(job_id), "restart\n")
+        if local_done.is_file():
+            local_done.write_text("restart\n")
     for key in plan.complete_markers:
         store.write_text(key, "")
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -380,9 +468,11 @@ def cli():
 @click.option("--allow-unfinished-deps", is_flag=True,
               help="Push dependencies that have no output/done.")
 @click.option("--yes", is_flag=True, help="Do not ask before large pushes.")
+@click.option("--force-duplicate", is_flag=True,
+              help="Launch even if a managed job with the same name is queued/running.")
 @click.option("-v", "--verbose", count=True, help="Increase verbosity (repeatable).")
 def launch(job_ids, tags, queries, dry, infra, whole_card, allow_high, restart_failed,
-           fresh, allow_unfinished_deps, yes, verbose):
+           fresh, allow_unfinished_deps, yes, force_duplicate, verbose):
     """Launch jobs on SkyPilot, selected by JOB_IDS and/or --tag/--query."""
     sky_cfg = _sky_config()
     store = _store(sky_cfg)
@@ -400,18 +490,25 @@ def launch(job_ids, tags, queries, dry, infra, whole_card, allow_high, restart_f
         for job in repository.find(query=query):
             print(f"  {job.id}: {job.metadata.get('tags', ['no tags'])[0]}")
             paths.append(Path(job.path))
-    paths = list(dict.fromkeys(Path(p) for p in paths))
+    # dedup by job id: a job given as JOB_ID may also match --tag/--query
+    by_id: dict = {}
+    for p in paths:
+        by_id.setdefault(Path(p).name, Path(p))
+    paths = list(by_id.values())
     if not paths:
         raise click.ClickException("No jobs selected (give JOB_IDS, --tag, or --query).")
 
     layout = lib.S3Layout(str(sky_cfg["prefix"]).rstrip("/"))
     r3_ref = _r3_ref()
+    managed_jobs = functools.lru_cache(maxsize=1)(lambda: _managed_jobs(skip_finished=True))
     for path in paths:
         _launch_job(path, repository, store, sky_cfg, layout, dry=dry, infra=infra,
                     whole_card=whole_card, allow_high=allow_high,
                     restart_failed=restart_failed, fresh=fresh,
                     allow_unfinished=allow_unfinished_deps, yes=yes, user=user,
-                    r3_ref=r3_ref, verbose=verbose)
+                    r3_ref=r3_ref, verbose=verbose,
+                    managed_jobs=managed_jobs,
+                    force_duplicate=force_duplicate)
 
 
 if __name__ == "__main__":

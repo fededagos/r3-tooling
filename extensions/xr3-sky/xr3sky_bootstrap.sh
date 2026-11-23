@@ -240,7 +240,8 @@ for triple in $XR3SKY_GIT; do
     log "fetching git bundle for $repo_path@$commit"
     s3 cp "$S3_BASE/git/$digest/$commit.bundle" "$bundle" --only-show-errors
     # Unbundle rather than clone: `git clone` imports only refs/heads and tags, and
-    # xr3-sky bundles a bare commit via a refs/xr3sky/<commit> ref.
+    # xr3-sky bundles a bare commit via a temporary refs/xr3sky/<commit>-<pid> ref.
+    # Only the objects matter: the commit is pinned by SHA below.
     [ -d "$dest" ] || { mkdir -p "$dest"; git init --quiet --bare "$dest"; }
     git -C "$dest" bundle unbundle "$bundle" >/dev/null
     # Pin the commit with a ref so `git fetch --depth=1 <dest> <commit>` can want it.

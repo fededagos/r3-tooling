@@ -326,8 +326,8 @@ def test_bootstrap_git_bundle_with_only_xr3sky_ref(tmp_path):
     digest = hashlib.sha256(repo_path.encode()).hexdigest()
     gdir = s3(tmp_path) / "git" / digest
     gdir.mkdir(parents=True)
-    _git("update-ref", f"refs/xr3sky/{c}", c, cwd=src)
-    _git("bundle", "create", str(gdir / f"{c}.bundle"), f"refs/xr3sky/{c}", cwd=src)
+    _git("update-ref", f"refs/xr3sky/{c}-4242", c, cwd=src)
+    _git("bundle", "create", str(gdir / f"{c}.bundle"), f"refs/xr3sky/{c}-4242", cwd=src)
     env["XR3SKY_GIT"] = f"{digest}:{repo_path}:{c}"
     r = run(env)
     assert r.returncode == 0, r.stderr

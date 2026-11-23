@@ -42,6 +42,10 @@ os.makedirs(log, exist_ok=True)
 argv = sys.argv[1:]
 if argv[:2] == ["api", "info"]:
     sys.exit(int(os.environ.get("FAKE_SKY_API_RC", "0")))
+if argv[:2] == ["jobs", "queue"]:
+    assert argv[2:4] == ["-o", "json"], argv
+    print(os.environ.get("FAKE_SKY_QUEUE", "[]"))
+    sys.exit(0)
 n = len([f for f in os.listdir(log) if f.endswith(".json")])
 with open(os.path.join(log, f"call{n}.json"), "w") as f:
     json.dump({"argv": argv, "env_names": sorted(os.environ),
@@ -278,3 +282,83 @@ def test_launch_confirm_threshold_prompts(env, tmp_path, monkeypatch):
     assert r.exit_code != 0
     assert calls(env["log"]) == []
     assert env["store"].objects == {}
+
+
+def _queue(monkeypatch, name, status, job_id=7):
+    monkeypatch.setenv("FAKE_SKY_QUEUE", json.dumps([{
+        "job_id": job_id, "job_name": name, "status": status,
+        "submitted_at": 1.0, "end_at": None}]))
+
+
+def test_launch_skips_duplicate_of_running_managed_job(env, monkeypatch):
+    name = f"tester-r3-{env['main'][:8]}"
+    _queue(monkeypatch, name, "RUNNING")
+    r = launch(env["main"], "--yes")
+    assert r.exit_code == 0, r.output
+    assert "already queued/running as managed job 7" in r.output
+    assert calls(env["log"]) == []
+    assert env["store"].objects == {}
+    # --dry reports it but still prints the plan
+    r = launch(env["main"], "--dry")
+    assert "already queued/running as managed job 7" in r.output
+    assert "--- task.yaml ---" in r.output
+    # finished jobs with that name do not block; --force-duplicate overrides
+    _queue(monkeypatch, name, "FAILED_SETUP")
+    assert launch(env["main"], "--yes").exit_code == 0
+    assert len(calls(env["log"])) == 1
+    _queue(monkeypatch, name, "PENDING")
+    assert launch(env["main"], "--yes", "--force-duplicate").exit_code == 0
+    assert len(calls(env["log"])) == 2
+
+
+def test_launch_fresh_relaunches_completed_job(env):
+    env["store"].write_text(LAYOUT.done(env["main"]), "")
+    local = env["repo"] / "jobs" / env["main"] / "output" / "done"
+    local.write_text("")
+    r = launch(env["main"], "--yes", "--fresh")
+    assert r.exit_code == 0, r.output
+    assert len(calls(env["log"])) == 1
+    assert not env["store"].exists(LAYOUT.done(env["main"]))
+    assert not local.exists()
+    assert local.with_name("done.pre-fresh").exists()
+
+
+def test_missing_default_secret_warns_and_is_omitted(env, tmp_path, monkeypatch):
+    cfg = tmp_path / "xr3c.yaml"
+    cfg.write_text(yaml.safe_dump({"sky": {"user": "tester",
+                                           "secrets": ["WANDB_API_KEY", "PRESENT_TOK"]}}))
+    monkeypatch.setenv("XR3_CONFIG", str(cfg))
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    monkeypatch.setenv("PRESENT_TOK", "x")
+    cli_mod._config.cache_clear()
+    r = launch(env["main"], "--yes")
+    assert r.exit_code == 0, r.output
+    assert "WARNING: secret WANDB_API_KEY" in r.stderr
+    (c,) = calls(env["log"])
+    assert "WANDB_API_KEY" not in c["argv"] and "PRESENT_TOK" in c["argv"]
+    task = yaml.safe_load((env["log"] / "call0.yaml").read_text())
+    assert "WANDB_API_KEY" not in task["secrets"] and "PRESENT_TOK" in task["secrets"]
+
+
+def test_missing_job_secret_is_hard_error(env, tmp_path, monkeypatch):
+    repo = r3.Repository(env["repo"])
+    job = _commit(repo, tmp_path / "src_sec", {
+        "run.sh": "echo s\n",
+        "sky.yaml": yaml.safe_dump({"secrets": {"JOB_ONLY_TOKEN": None}})})
+    monkeypatch.delenv("JOB_ONLY_TOKEN", raising=False)
+    r = CliRunner().invoke(cli_mod.cli, ["launch", job, "--yes"])
+    assert r.exit_code != 0
+    assert "JOB_ONLY_TOKEN" in r.output
+    assert env["store"].objects == {}
+    assert calls(env["log"]) == []
+
+
+def test_restart_rewrite_happens_only_after_uploads(env):
+    env["store"].write_text(LAYOUT.done(env["main"]), "failed\n")
+    def fail(p, k):
+        raise RuntimeError("upload broke")
+    env["store"].upload_file = fail
+    r = CliRunner().invoke(cli_mod.cli, ["launch", env["main"], "--yes", "-r"])
+    assert r.exit_code != 0
+    assert env["store"].read_text(LAYOUT.done(env["main"])) == "failed\n"
+
