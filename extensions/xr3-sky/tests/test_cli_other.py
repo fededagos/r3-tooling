@@ -253,3 +253,14 @@ def test_store_missing_profile_is_clean_error(monkeypatch):
     monkeypatch.setattr(cli_mod.s3, "BotoStore", boom)
     with pytest.raises(cli_mod.click.ClickException, match="credentials missing or invalid"):
         cli_mod._store({"bucket": "b", "endpoint": "e", "aws_profile": "enigma"})
+
+
+def test_pull_vpn_drop_is_clean_error(env):
+    def unreachable(*a, **k):
+        raise s3.StoreUnreachable("Could not connect to the endpoint URL")
+    env["store"].list = unreachable
+    r = CliRunner().invoke(cli_mod.cli, ["pull", env["main"]])
+    assert r.exit_code == 1
+    assert "S3 unreachable — connect to the Stanford VPN" in r.output
+    assert "Traceback" not in r.output
+    assert isinstance(r.exception, SystemExit)

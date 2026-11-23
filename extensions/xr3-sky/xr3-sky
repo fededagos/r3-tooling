@@ -78,6 +78,20 @@ def _ping(store, cfg: dict) -> None:
             f"bucket '{cfg.get('bucket')}' not found on {cfg.get('endpoint')}")
 
 
+_VPN_MSG = "S3 unreachable — connect to the Stanford VPN"
+
+
+def _vpn_hint(command):
+    """Turn S3 dropping out at any point of a command (VPN gone) into one clean line."""
+    @functools.wraps(command)
+    def wrapper(*args, **kwargs):
+        try:
+            return command(*args, **kwargs)
+        except s3.StoreUnreachable:
+            raise click.ClickException(_VPN_MSG)
+    return wrapper
+
+
 def _build_query(tags, queries) -> dict:
     """Build a Mongo-style query dict from tag/query CLI options.
 
@@ -115,7 +129,7 @@ def _preflight(store, need_sky: bool, cfg: dict) -> None:
     try:
         _ping(store, cfg)
     except s3.StoreUnreachable:
-        raise click.ClickException("S3 unreachable — connect to the Stanford VPN")
+        raise click.ClickException(_VPN_MSG)
     if need_sky:
         try:
             rc = subprocess.run([_sky_bin(), "api", "info"], capture_output=True,
@@ -452,7 +466,7 @@ def _launch_job(path: Path, repo, store, sky_cfg: dict, layout: lib.S3Layout, *,
                 out = Path(tmp) / f"{commit}.bundle"
                 _make_bundle(Path(repo.path) / repo_path, commit, out)
                 store.upload_file(out, key)
-    except click.ClickException:
+    except (click.ClickException, s3.StoreUnreachable):
         raise
     except Exception as e:
         raise click.ClickException(f"{job_id}: upload failed, nothing submitted: {e}")
@@ -468,7 +482,8 @@ def _launch_job(path: Path, repo, store, sky_cfg: dict, layout: lib.S3Layout, *,
     with tempfile.TemporaryDirectory() as tmp:
         yaml_path = Path(tmp) / f"{name}.yaml"
         yaml_path.write_text(task_yaml)
-        argv = [_sky_bin(), "jobs", "launch", "-y", "-n", name]
+        # -d: return once the job is submitted; do not stream its logs to the end.
+        argv = [_sky_bin(), "jobs", "launch", "-y", "-d", "-n", name]
         for n in secret_names:
             argv += ["--secret", n]
         argv.append(str(yaml_path))
@@ -476,6 +491,7 @@ def _launch_job(path: Path, repo, store, sky_cfg: dict, layout: lib.S3Layout, *,
         rc = subprocess.run(argv, env=env).returncode
     if rc != 0:
         raise click.ClickException(f"{job_id}: sky jobs launch failed (exit {rc})")
+    print(f"submitted {name}; follow with: xr3-sky logs {job_id}")
     return True
 
 
@@ -520,6 +536,7 @@ def cli():
 @click.option("--force-duplicate", is_flag=True,
               help="Launch even if a managed job with the same name is queued/running.")
 @click.option("-v", "--verbose", count=True, help="Increase verbosity (repeatable).")
+@_vpn_hint
 def launch(job_ids, tags, queries, dry, infra, whole_card, allow_high, restart_failed,
            fresh, allow_unfinished_deps, yes, force_duplicate, verbose):
     """Launch jobs on SkyPilot, selected by JOB_IDS and/or --tag/--query."""
@@ -642,6 +659,7 @@ def _pull_job(job_id: str, repo_path: Path, store, layout: lib.S3Layout, bucket:
 @click.option("--max-size", default=None,
               help="Leave files larger than this in S3 (default: sky.pull_max_size).")
 @click.option("--all", "all_files", is_flag=True, help="Download everything, ignoring --max-size.")
+@_vpn_hint
 def pull(job_ids, tags, queries, max_size, all_files):
     """Download job outputs from S3 into the local r3 repository."""
     sky_cfg = _sky_config()
@@ -712,6 +730,7 @@ def cancel(job_id):
 
 @cli.command()
 @click.argument("globs", nargs=-1)
+@_vpn_hint
 def status(globs):
     """Show done and managed-job state for jobs whose tags match the GLOBS."""
     sky_cfg = _sky_config()

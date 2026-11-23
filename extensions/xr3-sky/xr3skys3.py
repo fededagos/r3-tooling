@@ -5,6 +5,7 @@ fixed per Store instance. stdlib + pyyaml only at import time (boto3 is lazy).
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -89,23 +90,61 @@ _AUTH_CODES = {"403", "AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMat
 _MISSING_BUCKET_CODES = {"404", "NoSuchBucket", "NotFound"}
 
 
+def _connection_errors() -> tuple:
+    """botocore's connection-class errors: the endpoint (VPN) is not reachable."""
+    import botocore.exceptions as be
+    return (be.EndpointConnectionError, be.ConnectionClosedError,
+            be.ConnectTimeoutError, be.ReadTimeoutError, be.SSLError)
+
+
+def _connection_cause(exc: BaseException) -> Optional[BaseException]:
+    """`exc` or the first exception in its cause/context chain that is a
+    connection error (s3transfer wraps them, e.g. in S3UploadFailedError)."""
+    errors = _connection_errors()
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        if isinstance(exc, errors):
+            return exc
+        seen.add(id(exc))
+        exc = exc.__cause__ or exc.__context__
+    return None
+
+
+def _unreachable_on_connection_error(method):
+    """Re-raise connection-class errors from a BotoStore operation as StoreUnreachable."""
+    @functools.wraps(method)
+    def wrapper(*args, **kwargs):
+        try:
+            return method(*args, **kwargs)
+        except StoreUnreachable:
+            raise
+        except Exception as e:
+            cause = _connection_cause(e)
+            if cause is None:
+                raise
+            raise StoreUnreachable(str(cause)) from e
+    return wrapper
+
+
 class BotoStore:
     def __init__(self, bucket: str, endpoint: str, profile: Optional[str] = None):
         import boto3
         from botocore.config import Config
         self.bucket = bucket
         session = boto3.Session(profile_name=profile) if profile else boto3.Session()
+        # Fail fast when the endpoint is unreachable (VPN down): well under a minute,
+        # instead of botocore's default retries x 60 s timeouts.
         self.client = session.client(
             "s3", endpoint_url=endpoint,
-            config=Config(s3={"addressing_style": "path"}, max_pool_connections=32))
+            config=Config(s3={"addressing_style": "path"}, max_pool_connections=32,
+                          connect_timeout=10, read_timeout=120,
+                          retries={"max_attempts": 3, "mode": "standard"}))
 
+    @_unreachable_on_connection_error
     def ping(self) -> None:
         import botocore.exceptions as be
         try:
             self.client.head_bucket(Bucket=self.bucket)
-        except (be.EndpointConnectionError, be.ConnectionClosedError,
-                be.ConnectTimeoutError, be.ReadTimeoutError, be.SSLError) as e:
-            raise StoreUnreachable(str(e)) from e
         except (be.NoCredentialsError, be.PartialCredentialsError) as e:
             raise StoreAuthError(str(e)) from e
         except be.ClientError as e:
@@ -116,6 +155,7 @@ class BotoStore:
                 raise StoreBucketMissing(str(e)) from e
             raise
 
+    @_unreachable_on_connection_error
     def exists(self, key):
         import botocore.exceptions as be
         try:
@@ -126,6 +166,7 @@ class BotoStore:
                 return False
             raise
 
+    @_unreachable_on_connection_error
     def list(self, prefix):
         out = []
         for page in self.client.get_paginator("list_objects_v2").paginate(
@@ -134,22 +175,27 @@ class BotoStore:
                     for o in page.get("Contents", [])]
         return out
 
+    @_unreachable_on_connection_error
     def read_text(self, key):
         try:
             return self.client.get_object(Bucket=self.bucket, Key=key)["Body"].read().decode()
         except self.client.exceptions.NoSuchKey:
             return None
 
+    @_unreachable_on_connection_error
     def write_text(self, key, text):
         self.client.put_object(Bucket=self.bucket, Key=key, Body=text.encode())
 
+    @_unreachable_on_connection_error
     def upload_file(self, path, key):
         self.client.upload_file(str(path), self.bucket, key)
 
+    @_unreachable_on_connection_error
     def download_file(self, key, path):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.client.download_file(self.bucket, key, str(path))
 
+    @_unreachable_on_connection_error
     def delete_prefix(self, prefix):
         keys = [o.key for o in self.list(prefix)]
         deleted = 0

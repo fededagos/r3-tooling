@@ -62,10 +62,18 @@ endpoint_host() {  # http(s)://host[:port][/path] -> host
     local h="${1#*://}"
     echo "${h%%[:/]*}"
 }
+# The internal endpoint is opt-in and used only if it resolves AND serves the bucket:
+# a resolvable in-cluster RGW service need not be a usable S3 endpoint for it.
 ENDPOINT="$XR3SKY_ENDPOINT"
 if [ -n "$XR3SKY_ENDPOINT_INTERNAL" ] && command -v getent >/dev/null 2>&1 \
         && getent hosts "$(endpoint_host "$XR3SKY_ENDPOINT_INTERNAL")" >/dev/null 2>&1; then
-    ENDPOINT="$XR3SKY_ENDPOINT_INTERNAL"
+    if "$XR3SKY_AWS" --endpoint-url "$XR3SKY_ENDPOINT_INTERNAL" \
+            s3 ls "s3://$XR3SKY_BUCKET/${XR3SKY_PREFIX%/}/" >/dev/null 2>&1; then
+        ENDPOINT="$XR3SKY_ENDPOINT_INTERNAL"
+    else
+        log "internal endpoint $XR3SKY_ENDPOINT_INTERNAL resolves but is not usable for" \
+            "s3://$XR3SKY_BUCKET; falling back to $XR3SKY_ENDPOINT"
+    fi
 fi
 log "S3 endpoint: $ENDPOINT"
 

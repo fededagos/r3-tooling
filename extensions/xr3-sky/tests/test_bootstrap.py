@@ -164,6 +164,18 @@ def test_bootstrap_endpoint_falls_back_to_public(tmp_path):
     calls = (tmp_path / "aws.log").read_text().splitlines()
     assert all("--endpoint-url http://rgw.internal.svc:8080 " in c for c in calls)
 
+    # It resolves but does not serve the bucket (as rgw-cold.rook-ceph.svc on at):
+    # the probe fails and everything goes to the public endpoint.
+    (tmp_path / "aws.log").unlink()
+    env["FAKE_AWS_FAIL_ENDPOINT"] = "http://rgw.internal.svc:8080"
+    r = run(env)
+    assert r.returncode == 0, r.stderr
+    assert "not usable" in r.stderr and "https://s3.public.example:443" in r.stderr
+    calls = (tmp_path / "aws.log").read_text().splitlines()
+    probe, rest = calls[0], calls[1:]
+    assert "--endpoint-url http://rgw.internal.svc:8080 s3 ls s3://bucket/r3/" in probe
+    assert rest and all("--endpoint-url https://s3.public.example:443 " in c for c in rest)
+
 
 def test_bootstrap_periodic_sync_and_sigterm_does_not_mark_failed(tmp_path):
     env = setup(tmp_path, run_inner="echo early > output/early.txt\nsleep 30\n")

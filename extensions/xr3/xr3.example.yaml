@@ -33,7 +33,9 @@ slurm:                     # read only by xr3-slurm (MLCloud / galvani; ports to
 #   bucket: federico-r3
 #   prefix: r3
 #   endpoint: https://rgw-cold.enigmatic.stanford.edu
-#   endpoint_internal: http://rgw-cold.rook-ceph.svc   # in-cluster S3 endpoint
+#   endpoint_internal: null    # opt-in in-cluster S3 endpoint for pods; set it only after
+#                              # verifying it serves the bucket (pods probe it and fall
+#                              # back to `endpoint`). rgw-cold.rook-ceph.svc on at does NOT.
 #   aws_profile: enigma
 #   user: null                 # null => local part of $SKYPILOT_USER
 #   sync_interval: 300

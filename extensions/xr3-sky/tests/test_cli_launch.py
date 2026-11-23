@@ -33,7 +33,10 @@ def test_launch_submits_with_secrets_by_name_only(env):
     assert r.exit_code == 0, r.output
     (c,) = calls(env["log"])
     argv = c["argv"]
-    assert argv[:5] == ["jobs", "launch", "-y", "-n", f"tester-r3-{env['main'][:8]}"]
+    # -d: return once submitted instead of streaming the run's logs
+    assert argv[:6] == ["jobs", "launch", "-y", "-d", "-n", f"tester-r3-{env['main'][:8]}"]
+    assert f"submitted tester-r3-{env['main'][:8]}; follow with: xr3-sky logs {env['main']}" \
+        in r.output
     assert "--secret" in argv and "AWS_ACCESS_KEY_ID" in argv
     assert "AWS_SECRET_ACCESS_KEY" in argv
     assert not any(SENTINEL in a for a in argv)
@@ -249,3 +252,26 @@ def test_restart_rewrite_happens_only_after_uploads(env):
     assert r.exit_code != 0
     assert env["store"].read_text(LAYOUT.done(env["main"])) == "failed\n"
 
+
+
+def _unreachable(*a, **k):
+    raise s3.StoreUnreachable("Could not connect to the endpoint URL")
+
+
+def test_launch_vpn_drop_mid_launch_is_clean_error(env):
+    env["store"].exists = _unreachable      # ping passed; S3 drops during plan_push
+    r = CliRunner().invoke(cli_mod.cli, ["launch", env["main"], "--yes"])
+    assert r.exit_code == 1
+    assert "S3 unreachable — connect to the Stanford VPN" in r.output
+    assert "Traceback" not in r.output
+    assert isinstance(r.exception, SystemExit)
+    assert calls(env["log"]) == []
+
+
+def test_launch_vpn_drop_during_upload_is_clean_error(env):
+    env["store"].upload_file = _unreachable
+    r = CliRunner().invoke(cli_mod.cli, ["launch", env["main"], "--yes"])
+    assert r.exit_code == 1
+    assert "S3 unreachable — connect to the Stanford VPN" in r.output
+    assert not any(k.endswith(".complete") for k in env["store"].objects)
+    assert calls(env["log"]) == []

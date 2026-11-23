@@ -10,14 +10,21 @@ set -euo pipefail
 
 args=()
 excludes=()
+endpoint=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --exclude) excludes+=("$2"); shift 2 ;;
-        --endpoint-url|--region|--profile|--include) shift 2 ;;
+        --endpoint-url) endpoint="$2"; shift 2 ;;
+        --region|--profile|--include) shift 2 ;;
         --*) shift ;;
         *) args+=("$1"); shift ;;
     esac
 done
+# FAKE_AWS_FAIL_ENDPOINT: every call through this endpoint fails (resolves, but
+# does not serve the bucket).
+if [ -n "${FAKE_AWS_FAIL_ENDPOINT:-}" ] && [ "$endpoint" = "$FAKE_AWS_FAIL_ENDPOINT" ]; then
+    echo "fake_aws: argument of type 'NoneType' is not iterable" >&2; exit 255
+fi
 [ "${args[0]:-}" = s3 ] || { echo "fake_aws: only 's3' is supported" >&2; exit 2; }
 
 local_path() {  # s3://bucket/key -> $FAKE_S3_ROOT/bucket/key; others unchanged

@@ -278,3 +278,95 @@ def test_boto_ping_reraises_other_client_errors():
     from botocore.exceptions import ClientError
     with pytest.raises(ClientError):
         store.ping()
+
+
+
+# --- every BotoStore operation maps connection errors (stub client) -------------
+
+class _DeadClient:
+    """Every S3 call fails as if the endpoint (VPN) is gone."""
+
+    class exceptions:
+        class NoSuchKey(Exception):
+            pass
+
+    def __init__(self, exc):
+        self.exc = exc
+
+    def __getattr__(self, name):
+        def call(*a, **k):
+            raise self.exc
+        return call
+
+    def get_paginator(self, name):
+        exc = self.exc
+
+        class P:
+            def paginate(self, **k):
+                raise exc
+        return P()
+
+
+@pytest.mark.parametrize("make", [
+    lambda be: be.EndpointConnectionError(endpoint_url="https://x"),
+    lambda be: be.ConnectTimeoutError(endpoint_url="https://x"),
+    lambda be: be.ReadTimeoutError(endpoint_url="https://x"),
+    lambda be: be.ConnectionClosedError(endpoint_url="https://x"),
+    lambda be: be.SSLError(endpoint_url="https://x", error="bad"),
+])
+@pytest.mark.parametrize("op", [
+    lambda st, tmp: st.exists("k"),
+    lambda st, tmp: st.list("p/"),
+    lambda st, tmp: st.read_text("k"),
+    lambda st, tmp: st.write_text("k", "v"),
+    lambda st, tmp: st.upload_file(tmp / "f", "k"),
+    lambda st, tmp: st.download_file("k", tmp / "d"),
+    lambda st, tmp: st.delete_prefix("p/"),
+])
+def test_boto_ops_map_connection_errors(make, op, tmp_path):
+    be = pytest.importorskip("botocore.exceptions")
+    store = object.__new__(s3.BotoStore)
+    store.bucket = "b"
+    store.client = _DeadClient(make(be))
+    (tmp_path / "f").write_text("x")
+    with pytest.raises(s3.StoreUnreachable):
+        op(store, tmp_path)
+
+
+def test_boto_upload_failure_wrapping_connection_error_is_unreachable(tmp_path):
+    be = pytest.importorskip("botocore.exceptions")
+    bex = pytest.importorskip("boto3.exceptions")
+    try:
+        try:
+            raise be.EndpointConnectionError(endpoint_url="https://x")
+        except Exception as inner:
+            raise bex.S3UploadFailedError("Failed to upload") from inner
+    except bex.S3UploadFailedError as e:
+        wrapped = e
+    store = object.__new__(s3.BotoStore)
+    store.bucket = "b"
+    store.client = _DeadClient(wrapped)
+    (tmp_path / "f").write_text("x")
+    with pytest.raises(s3.StoreUnreachable):
+        store.upload_file(tmp_path / "f", "k")
+
+
+def test_boto_ops_keep_other_errors():
+    be = pytest.importorskip("botocore.exceptions")
+    store = object.__new__(s3.BotoStore)
+    store.bucket = "b"
+    store.client = _DeadClient(_client_error("500"))
+    with pytest.raises(be.ClientError):
+        store.exists("k")
+
+
+def test_boto_client_fails_fast():
+    pytest.importorskip("boto3")
+    store = s3.BotoStore("b", "https://s3.invalid.example", None)
+    cfg = store.client.meta.config
+    assert cfg.connect_timeout == 10 and cfg.read_timeout == 120
+    # botocore normalises retries={"max_attempts": 3} to 4 attempts in total:
+    # worst case ~4 x 10 s connect timeouts plus backoff, well under a minute.
+    assert cfg.retries == {"total_max_attempts": 4, "mode": "standard"}
+    assert cfg.max_pool_connections == 32
+    assert cfg.s3 == {"addressing_style": "path"}

@@ -29,7 +29,9 @@ DEFAULTS = {
         "bucket": "federico-r3",
         "prefix": "r3",
         "endpoint": "https://rgw-cold.enigmatic.stanford.edu",
-        "endpoint_internal": "http://rgw-cold.rook-ceph.svc",  # in-cluster S3 endpoint
+        # Opt-in in-cluster endpoint for pods; null => public `endpoint` only.
+        # (rgw-cold.rook-ceph.svc resolves on at but does not serve the bucket.)
+        "endpoint_internal": None,
         "aws_profile": "enigma",
         "user": None,               # null => local part of $SKYPILOT_USER
         "sync_interval": 300,

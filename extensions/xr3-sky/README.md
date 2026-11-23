@@ -81,7 +81,7 @@ inlined into every task as its `run:`. Design: [`docs/specs/2026-11-23-xr3-sky-d
      bucket: federico-r3            # your bucket on the RGW
      prefix: r3                     # key prefix inside the bucket
      endpoint: https://rgw-cold.enigmatic.stanford.edu
-     endpoint_internal: http://rgw-cold.rook-ceph.svc   # used by pods that can resolve it (at)
+     endpoint_internal: null        # opt-in in-cluster endpoint; only if verified to serve the bucket
      aws_profile: enigma
      user: null                     # null => local part of $SKYPILOT_USER
      sync_interval: 300             # seconds between output syncs in the pod
@@ -113,7 +113,7 @@ ID=$(xr3 history --latest --id .)
 sky-up                                      # Teleport tunnel to the SkyPilot API
 # connect the Stanford VPN                  # S3 from the laptop
 xr3-sky launch --dry "$ID"                  # rendered task.yaml + upload plan; writes nothing
-xr3-sky launch "$ID"                        # push to S3, then `sky jobs launch`
+xr3-sky launch "$ID"                        # push to S3, submit; returns once submitted
 xr3-sky status 'demo/*'                     # done state + managed-job state
 xr3-sky logs "$ID"                          # stream the pod's log
 xr3-sky pull "$ID"                          # once it is done: S3 -> $R3_REPOSITORY/jobs/$ID/output
@@ -142,7 +142,9 @@ Jobs are selected by `JOB_IDS` and/or `--tag`/`--query`, de-duplicated, exactly 
 5. refuses if a managed job with the same name is still queued or running;
 6. asks before pushing more than `push_confirm_above`, uploads, writes the markers and a
    copy of the rendered task to `runs/<id>/<ts>/task.yaml`;
-7. runs `sky jobs launch -y -n <name> --secret … <task.yaml>`.
+7. runs `sky jobs launch -y -d -n <name> --secret … <task.yaml>`. `-d` (detach) returns
+   as soon as the job is submitted, so a multi-job launch does not block on each run;
+   `launch` then prints `submitted <name>; follow with: xr3-sky logs <id>`.
 
 Steps 1–5 are read-only: a refused spec or push leaves S3 untouched.
 
@@ -283,7 +285,9 @@ file) is `completed`.
 `github.com/mtangemann/r3`) and `awscli` as uv tools. `run` is
 [`xr3sky_bootstrap.sh`](xr3sky_bootstrap.sh):
 
-1. pick the S3 endpoint: `endpoint_internal` when it resolves (at), else the public one;
+1. pick the S3 endpoint: the public `endpoint`, unless `endpoint_internal` is set,
+   resolves, and passes an `aws s3 ls` probe of the bucket (it is opt-in and unset by
+   default: `rgw-cold.rook-ceph.svc` resolves on at but does not serve the bucket);
 2. restore `jobs/<id>/output/` from S3 (resume);
 3. build a sparse r3 repo at `$HOME/r3_repo`: `r3.yaml`, the job, every job dependency,
    the git bundles; then `r3 rebuild-index`;

@@ -34,7 +34,7 @@ The VPN and the Teleport tunnel coexist. Ask the human to connect the VPN; you c
 
 ```bash
 xr3-sky launch --dry <id>      # upload plan + rendered task.yaml; writes nothing
-xr3-sky launch <id>            # push to S3, then `sky jobs launch`
+xr3-sky launch <id>            # push + submit (detached): "submitted <name>; follow with: xr3-sky logs <id>"
 xr3-sky status '<tag-glob>'    # done state (S3) + managed-job state
 xr3-sky logs <id>              # stream; pod lines start with [xr3sky]
 xr3-sky pull <id>              # after it finishes: S3 -> $R3_REPOSITORY/jobs/<id>/output
