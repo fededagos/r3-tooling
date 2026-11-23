@@ -102,7 +102,8 @@ The S3 copy of `output/done` decides; the local copy counts only when S3 has non
 downstream `xr3-sky` job gets the full output from S3 anyway (`launch` checks that S3 has
 it); a downstream job run elsewhere needs `pull --all` first. A dependency pushed with
 `--allow-unfinished-deps` gets no `output.complete` and is re-uploaded on every launch;
-`launch --repush-deps` re-uploads finished dependencies' local output on purpose.
+`launch --repush-deps` re-uploads finished dependencies' non-empty local output on purpose
+(it overwrites the S3 copy: `pull` a dependency first if it was rerun on SkyPilot).
 
 ## Pointer jobs
 
@@ -127,7 +128,8 @@ anything long-lived. Template: `examples/pointer-job/`.
 | `secrets in sky.yaml must be names only (null values)` | `secrets: {NAME: null}`; export the value. |
 | `already queued/running as managed job N (…)` | Wait or `cancel`; `--force-duplicate` only on purpose. |
 | `secret(s) not set in the environment: NAME` | Export the secret the job's `sky.yaml` lists. |
-| `<id>: in progress (no done marker in S3)` / `(restart)` / `in progress, skipping` | Not finished: check `status`, pull later. |
+| `<id>: in progress (no done marker in S3)` / `(restart)` | Not finished: check `status`, pull later. |
+| `<id>: not certified yet (no output.complete)` | Live managed job in `status`: wait. None: `xr3-sky launch <id>` certifies it without recomputing. |
 | `No run script in <dir>.` | Pointer/raw-data jobs are not launchable; others need the house `run.sh`. |
 
 Everything else: the troubleshooting table in `extensions/xr3-sky/README.md`.

@@ -329,7 +329,10 @@ def plan_push(job_id: str, job_dir: Path, deps: list[DepInfo],
 
     for d in deps:
         complete = store.exists(layout.complete(d.job_id))
-        has_local = d.local_output is not None and Path(d.local_output).is_dir()
+        # r3 creates an empty output/ for every committed job, so "has local output"
+        # means the directory holds something, not merely that it exists.
+        has_local = (d.local_output is not None and Path(d.local_output).is_dir()
+                     and any(Path(d.local_output).iterdir()))
         if d.has_remote_yaml and not complete:
             raise PushError(
                 f"dependency {d.job_id} has REMOTE.yaml but no complete output in S3")

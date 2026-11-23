@@ -55,10 +55,36 @@ def test_launch_submits_with_secrets_by_name_only(env):
 
 def test_launch_skips_completed_job_in_s3(env):
     env["store"].write_text(LAYOUT.done(env["main"]), "")
+    env["store"].write_text(LAYOUT.complete(env["main"]), "")
     r = launch(env["main"], "--yes")
     assert r.exit_code == 0, r.output
     assert calls(env["log"]) == []
     assert not env["store"].exists(LAYOUT.files_complete(env["main"]))
+
+
+def test_launch_recertifies_completed_job_without_output_complete(env):
+    # The pod uploaded done=completed but died before writing output.complete.
+    # Relaunching must run the job again: the house run.sh no-ops on the completed
+    # marker and the bootstrap's final sync writes output.complete.
+    env["store"].write_text(LAYOUT.done(env["main"]), "completed\n")
+    r = launch(env["main"], "--yes")
+    assert r.exit_code == 0, r.output
+    assert "not certified" in r.output
+    assert len(calls(env["log"])) == 1
+    # the marker is left as is: the pod's guard must still see `completed`
+    assert env["store"].read_text(LAYOUT.done(env["main"])) == "completed\n"
+
+
+def test_launch_skips_locally_completed_job_never_on_s3(env):
+    # Completed locally (e.g. run under SLURM or on the laptop), never launched
+    # with xr3-sky: there is nothing to certify, so it is skipped as before.
+    done = env["repo"] / "jobs" / env["main"] / "output" / "done"
+    done.parent.mkdir(parents=True, exist_ok=True)
+    done.write_text("completed\n")
+    r = launch(env["main"], "--yes")
+    assert r.exit_code == 0, r.output
+    assert "skipping (completed)" in r.output
+    assert calls(env["log"]) == []
 
 
 def test_launch_restart_failed_rewrites_s3_marker(env):

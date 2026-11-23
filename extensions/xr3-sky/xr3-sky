@@ -384,11 +384,19 @@ def _launch_job(path: Path, repo, store, sky_cfg: dict, layout: lib.S3Layout, *,
         raise click.ClickException(str(e))
 
     local_done = path / "output" / "done"
+    s3_done = store.read_text(layout.done(job_id))
     state = lib.effective_done(
-        store.read_text(layout.done(job_id)),
-        local_done.read_text() if local_done.is_file() else None)
+        s3_done, local_done.read_text() if local_done.is_file() else None)
     # --fresh reruns from scratch: it bypasses the done state entirely.
     decision = "launch" if fresh else lib.launch_decision(state, restart_failed)
+    if (decision == "skip" and state == "completed" and s3_done is not None
+            and not store.exists(layout.complete(job_id))):
+        # The pod uploaded done=completed but not output.complete (it died between
+        # the two). Relaunch: the house run.sh no-ops on `completed`, and the
+        # bootstrap's final sync then certifies the output.
+        print(f"{job_id}: completed but not certified (no output.complete); "
+              "relaunching to certify")
+        decision = "launch"
     if decision == "skip":
         print(f"{job_id}: skipping ({state})")
         return False
@@ -645,7 +653,9 @@ def _pull_job(job_id: str, repo_path: Path, store, layout: lib.S3Layout, bucket:
     # completed: only once the pod has certified the output (final sync done);
     # failed: pullable as it is, to inspect the partial output.
     if state == "completed" and not store.exists(layout.complete(job_id)):
-        print(f"{job_id}: in progress, skipping")
+        print(f"{job_id}: not certified yet (no output.complete), skipping. It is "
+              "either still finishing, or its pod died before certifying; if "
+              f"`xr3-sky status` shows no live managed job, run: xr3-sky launch {job_id}")
         return
     objects = store.list(prefix)
     download, remote = s3.split_for_pull(objects, max_bytes)

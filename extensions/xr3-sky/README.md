@@ -162,7 +162,7 @@ Steps 1–5 are read-only: a refused spec or push leaves S3 untouched.
 | `-r, --restart-failed` | Relaunch jobs whose done state is `failed` (rewrites the marker to `restart`). |
 | `--fresh` | Delete the job's S3 `output/` and `output.complete` first, then launch, whatever the done state. |
 | `--allow-unfinished-deps` | Push dependencies that have no `output/done` (with a warning). No `output.complete` is written for such a dependency, so its output is uploaded again on every launch until it finishes. |
-| `--repush-deps` | Upload dependency outputs again even if S3 already has their `output.complete` (only dependencies with local output; the marker stays). Use it after changing a finished dependency's output locally. |
+| `--repush-deps` | Upload dependency outputs again even if S3 already has their `output.complete` (only dependencies whose local `output/` is non-empty; dependencies that only ran on SkyPilot are skipped; the marker stays). Use it after changing a finished dependency's output locally. **Caution:** it overwrites the S3 copy with your local one, so if the dependency was rerun on SkyPilot after you last pulled it, `pull` it first. |
 | `--yes` | Do not ask before a push larger than `push_confirm_above`. |
 | `--force-duplicate` | Launch even if a managed job with the same name is queued or running. |
 | `-v, --verbose` | `-v` prints the upload plan; `-vv` also lists every file. |
@@ -175,8 +175,11 @@ reads the S3 `done` marker and pulls only a finished job:
 - no S3 output: `no S3 output for <id>`;
 - output but no marker: `<id>: in progress (no done marker in S3), skipping`;
 - `restart` (a rerun is under way): `<id>: in progress (restart), skipping`;
-- completed but no `output.complete` yet (the pod's final sync has not finished):
-  `<id>: in progress, skipping`;
+- completed but no `output.complete` yet (the pod's final sync has not finished, or the pod
+  died between uploading `done` and certifying):
+  `<id>: not certified yet (no output.complete), skipping…`. If `status` shows no live managed
+  job, `xr3-sky launch <id>` certifies it: the house `run.sh` no-ops on `completed` and the
+  bootstrap's final sync writes `output.complete` (nothing is recomputed);
 - `failed`: pulled as it is, so you can read its logs and partial output.
 
 Only then does it list and download. It skips files that are already identical: same
@@ -457,7 +460,8 @@ r3 job id.
 | Message | Fix |
 |---|---|
 | `no S3 output for <id>` | The job never ran with `xr3-sky`, or never synced yet. |
-| `<id>: in progress (no done marker in S3), skipping` / `<id>: in progress (restart), skipping` / `<id>: in progress, skipping` | Wait until it finishes (`xr3-sky status`). |
+| `<id>: in progress (no done marker in S3), skipping` / `<id>: in progress (restart), skipping` | Wait until it finishes (`xr3-sky status`). |
+| `<id>: not certified yet (no output.complete), skipping…` | If `status` shows a live managed job, wait. Otherwise run `xr3-sky launch <id>`: it prints `completed but not certified (no output.complete); relaunching to certify` and the pod writes the marker without recomputing. |
 | `WARNING: skipping unsafe S3 key '<key>'` | A key would land outside `output/`; it is skipped on purpose. |
 | `no managed job named <user>-r3-<id8>` | Never launched under this user, or `sky jobs queue` no longer lists it. |
 

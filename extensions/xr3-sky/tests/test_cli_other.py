@@ -287,7 +287,8 @@ def test_pull_skips_completed_without_output_complete(env):
     seed_output(env, env["main"], {"a.txt": b"a"}, done="completed\n", complete=False)
     r = run("pull", env["main"])
     assert r.exit_code == 0, r.output
-    assert f"{env['main']}: in progress, skipping" in r.output
+    assert f"{env['main']}: not certified yet (no output.complete), skipping" in r.output
+    assert f"xr3-sky launch {env['main']}" in r.output
     assert not (out_dir(env, env["main"]) / "a.txt").exists()
     assert not (out_dir(env, env["main"]) / "done").exists()
 

@@ -417,6 +417,27 @@ def test_plan_push_repush_deps_without_local_output_skips(tmp_path):
     assert "depR" in p.skipped and not any("depR" in k for _, k in p.uploads)
 
 
+def test_plan_push_repush_deps_with_empty_local_output_dir_skips(tmp_path):
+    # r3 creates an empty output/ for every committed job, so a dependency that
+    # only ran on SkyPilot has an empty local output/: --repush-deps must skip it.
+    job = make_job(tmp_path)
+    out = tmp_path / "depE" / "output"
+    out.mkdir(parents=True)
+    p = s3.plan_push("J", job, [s3.DepInfo("depE", out, False, False, False)], [],
+                     _complete("depE"), LAYOUT, False, repush_deps=True)
+    assert "depE" in p.skipped and not any("depE/output" in k for _, k in p.uploads)
+    assert p.warnings == []
+
+
+def test_plan_push_empty_local_output_and_not_in_s3_says_no_output(tmp_path):
+    job = make_job(tmp_path)
+    out = tmp_path / "depE" / "output"
+    out.mkdir(parents=True)
+    with pytest.raises(s3.PushError, match="has no output locally or in S3"):
+        s3.plan_push("J", job, [s3.DepInfo("depE", out, False, False, False)], [],
+                     s3.MemoryStore(), LAYOUT, True)
+
+
 def test_plan_push_never_uploads_local_remote_yaml(tmp_path):
     job = make_job(tmp_path)
     dep = make_dep(tmp_path, has_remote_yaml=True)
