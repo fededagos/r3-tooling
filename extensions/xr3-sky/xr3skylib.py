@@ -61,6 +61,9 @@ class S3Layout:
     def files(self, job_id: str) -> str:
         return f"{self._job(job_id)}/files/"
 
+    def files_complete(self, job_id: str) -> str:
+        return f"{self._job(job_id)}/files.complete"
+
     def output(self, job_id: str) -> str:
         return f"{self._job(job_id)}/output/"
 

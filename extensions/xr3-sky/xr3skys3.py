@@ -129,10 +129,15 @@ class BotoStore:
 
     def delete_prefix(self, prefix):
         keys = [o.key for o in self.list(prefix)]
+        deleted = 0
         for i in range(0, len(keys), 1000):
-            self.client.delete_objects(Bucket=self.bucket, Delete={
-                "Objects": [{"Key": k} for k in keys[i:i + 1000]]})
-        return len(keys)
+            resp = self.client.delete_objects(Bucket=self.bucket, Delete={
+                "Objects": [{"Key": k} for k in keys[i:i + 1000]], "Quiet": False})
+            if resp.get("Errors"):
+                raise RuntimeError("failed to delete: " + ", ".join(
+                    e.get("Key", "?") for e in resp["Errors"]))
+            deleted += len(resp.get("Deleted", []))
+        return deleted
 
 
 @dataclass
@@ -158,13 +163,22 @@ class PushPlan:
 
 
 def _tree(root: Path, exclude_top: Optional[str] = None):
+    """Yield (path, posix relpath) for files under root.
+
+    File symlinks upload the target's content; broken links and symlinked
+    directories raise PushError.
+    """
     for p in sorted(root.rglob("*")):
-        if not p.is_file():
-            continue
         rel = p.relative_to(root)
         if exclude_top and rel.parts[0] == exclude_top:
             continue
-        yield p, rel.as_posix()
+        if p.is_symlink():
+            if not p.exists():
+                raise PushError(f"broken symlink: {p}")
+            if p.is_dir():
+                raise PushError(f"symlinked directory not supported: {p}")
+        if p.is_file():
+            yield p, rel.as_posix()
 
 
 def plan_push(job_id: str, job_dir: Path, deps: list[DepInfo],
@@ -175,11 +189,12 @@ def plan_push(job_id: str, job_dir: Path, deps: list[DepInfo],
         if d.env_marker:
             raise PushError(f"depends on a container/venv environment job {d.job_id}")
 
-    if store.list(layout.files(job_id)):
+    if store.exists(layout.files_complete(job_id)):
         plan.skipped.append(job_id)
     else:
         for p, rel in _tree(Path(job_dir), exclude_top="output"):
             plan.uploads.append((p, layout.files(job_id) + rel))
+        plan.complete_markers.append(layout.files_complete(job_id))
 
     for d in deps:
         if d.has_remote_yaml or store.exists(layout.complete(d.job_id)):
@@ -214,7 +229,10 @@ def split_for_pull(objects: list[ObjectInfo], max_bytes: Optional[int]
 
 
 def remote_yaml(remote: list[ObjectInfo], bucket: str, output_prefix: str) -> str:
+    for o in remote:
+        if not o.key.startswith(output_prefix):
+            raise ValueError(f"key {o.key!r} does not start with {output_prefix!r}")
     return yaml.safe_dump([
-        {"path": o.key[len(output_prefix):] if o.key.startswith(output_prefix) else o.key,
+        {"path": o.key[len(output_prefix):],
          "size": o.size, "etag": o.etag, "uri": f"s3://{bucket}/{o.key}"}
         for o in remote], sort_keys=False)

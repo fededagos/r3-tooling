@@ -49,10 +49,63 @@ def test_plan_push_skips_already_uploaded_files_prefix(tmp_path):
     job = make_job(tmp_path)
     store = s3.MemoryStore()
     store.write_text("r3/jobs/J/files/run.sh", "x")
+    store.write_text(LAYOUT.files_complete("J"), "")
     p = plan(job, [], store)
     assert p.uploads == []
     assert p.total_bytes == 0
-    assert p.skipped
+    assert p.skipped == ["J"]
+    assert p.complete_markers == []
+
+
+def test_plan_push_partial_files_upload_is_redone(tmp_path):
+    job = make_job(tmp_path)
+    store = s3.MemoryStore()
+    store.write_text("r3/jobs/J/files/run.sh", "x")
+    p = plan(job, [], store)
+    assert len(p.uploads) == 2
+    assert p.complete_markers == ["r3/jobs/J/files.complete"]
+
+
+def test_plan_push_symlinks(tmp_path):
+    job = make_job(tmp_path)
+    (job / "link.txt").symlink_to(job / "run.sh")
+    p = plan(job, [], s3.MemoryStore())
+    assert "r3/jobs/J/files/link.txt" in {k for _, k in p.uploads}
+    (job / "bad").symlink_to(tmp_path / "nope")
+    with pytest.raises(s3.PushError, match="bad"):
+        plan(job, [], s3.MemoryStore())
+    (job / "bad").unlink()
+    (job / "dlink").symlink_to(job / "sub")
+    with pytest.raises(s3.PushError, match="symlinked directory not supported"):
+        plan(job, [], s3.MemoryStore())
+
+
+def test_plan_push_dep_symlink_policy(tmp_path):
+    job = make_job(tmp_path)
+    dep = make_dep(tmp_path)
+    (dep.local_output / "bad").symlink_to(tmp_path / "nope")
+    with pytest.raises(s3.PushError, match="bad"):
+        plan(job, [dep], s3.MemoryStore())
+
+
+def test_plan_push_dep_without_local_output_but_complete_in_s3(tmp_path):
+    job = make_job(tmp_path)
+    store = s3.MemoryStore()
+    store.write_text("r3/jobs/depR/output.complete", "")
+    p = plan(job, [s3.DepInfo("depR", None, False, False, False)], store)
+    assert "depR" in p.skipped and not any("depR" in k for _, k in p.uploads)
+
+
+def test_plan_push_existing_bundle_not_missing(tmp_path):
+    job = make_job(tmp_path)
+    store = s3.MemoryStore()
+    store.write_text(LAYOUT.git_bundle("/repo", "abc"), "b")
+    assert plan(job, [], store, git_deps=[("/repo", "abc")]).missing_bundles == []
+
+
+def test_remote_yaml_bad_prefix():
+    with pytest.raises(ValueError):
+        s3.remote_yaml([s3.ObjectInfo("other/x", 1, "e")], "b", "r3/jobs/J/output/")
 
 
 def test_plan_push_dep_with_remote_yaml_not_uploaded(tmp_path):
@@ -60,7 +113,7 @@ def test_plan_push_dep_with_remote_yaml_not_uploaded(tmp_path):
     dep = make_dep(tmp_path, has_remote_yaml=True)
     p = plan(job, [dep], s3.MemoryStore())
     assert not any("dep1" in k for _, k in p.uploads)
-    assert p.complete_markers == []
+    assert p.complete_markers == ["r3/jobs/J/files.complete"]
     assert "dep1" in p.skipped
 
 
@@ -71,7 +124,7 @@ def test_plan_push_uploads_dep_output_with_marker(tmp_path):
     keys = {k for _, k in p.uploads}
     assert "r3/jobs/dep1/output/r.txt" in keys
     assert "r3/jobs/dep1/output/done" in keys
-    assert p.complete_markers == ["r3/jobs/dep1/output.complete"]
+    assert p.complete_markers == ["r3/jobs/J/files.complete", "r3/jobs/dep1/output.complete"]
     assert p.missing_bundles == [LAYOUT.git_bundle("/repo", "abc")]
 
 
@@ -81,7 +134,7 @@ def test_plan_push_dep_complete_in_store_skipped(tmp_path):
     store = s3.MemoryStore()
     store.write_text("r3/jobs/dep1/output.complete", "")
     p = plan(job, [dep], store)
-    assert p.complete_markers == []
+    assert p.complete_markers == ["r3/jobs/J/files.complete"]
     assert not any("dep1" in k for _, k in p.uploads)
 
 
@@ -112,6 +165,8 @@ def test_split_for_pull_threshold():
     objs = [s3.ObjectInfo("a", 10, "e"), s3.ObjectInfo("b", 150_000_000, "f")]
     dl, remote = s3.split_for_pull(objs, 100_000_000)
     assert [o.key for o in dl] == ["a"] and [o.key for o in remote] == ["b"]
+    dl, remote = s3.split_for_pull([s3.ObjectInfo("c", 100, "e")], 100)
+    assert [o.key for o in dl] == ["c"] and remote == []
     dl, remote = s3.split_for_pull(objs, None)
     assert len(dl) == 2 and remote == []
 

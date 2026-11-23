@@ -212,3 +212,7 @@ def test_launch_decision_table():
     assert lib.launch_decision("restart", False) == "launch"
     assert lib.launch_decision("failed", False) == "skip"
     assert lib.launch_decision("failed", True) == "launch_rewrite_restart"
+
+
+def test_files_complete_key():
+    assert lib.S3Layout("r3").files_complete("J") == "r3/jobs/J/files.complete"
