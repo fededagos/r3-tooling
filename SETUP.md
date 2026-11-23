@@ -1,6 +1,6 @@
 # SETUP — installing the full r3 toolchain
 
-This gets `r3`, `xr3`, `xr3-slurm`, and `foreman` all working from everywhere you'd invoke
+This gets `r3`, `xr3`, `xr3-slurm`, `xr3-sky`, and `foreman` all working from everywhere you'd invoke
 them — interactive shells, non-interactive shells, `subprocess`/`execvp`, cron, and agent
 tool-calls — sharing one Python env, one set of `PATH` wrappers, and one config file. There
 are two ways to get there: run the installer (§1, recommended), or do the same steps by hand
@@ -56,7 +56,7 @@ Common flags (all have real defaults, so `--yes` alone is a complete install):
 - `--toolchain-root DIR` (default `~/r3-toolchain`) — where the `r3`/`foreman` clones and
   the venv live.
 - `--bin-dir DIR` (default `~/bin`, or `$LUSTREWORK/bin` if that directory exists) — where
-  the `r3`/`xr3`/`xr3-slurm`/`foreman` wrapper scripts are written.
+  the `r3`/`xr3`/`xr3-slurm`/`xr3-sky`/`foreman` wrapper scripts are written.
 - `--config PATH` (default `~/.config/xr3.yaml`) — the xr3 config file.
 - `--projects-dir DIR` (default `~/projects`) — written into the config as a **base root**
   (§4), i.e. the directory whose subdirectories the pathmap covers.
@@ -82,7 +82,7 @@ The mental model, in one picture:
   **editable-installed**, plus `xr3`'s own runtime deps (`click`, `pyyaml`, `executor`,
   `tqdm`). r3 requires Python **>=3.9,<3.13**, which is why the installer defaults to
   `--python 3.12`.
-- **Wrapper scripts on `PATH`** — `r3`, `xr3`, `xr3-slurm`, `foreman` — each a tiny shell
+- **Wrapper scripts on `PATH`** — `r3`, `xr3`, `xr3-slurm`, `xr3-sky`, `foreman` — each a tiny shell
   script that `exec`s into that venv's interpreter (see §3 for why these are files, not shell
   functions).
 - **One config file**, `~/.config/xr3.yaml` by default, with a **base root** over your
@@ -125,7 +125,7 @@ git clone --branch dev git@github.com:matthias-k/foreman.git ~/r3-toolchain/fore
 uv pip install --python ~/r3-toolchain/.venv/bin/python \
   -e ~/r3-toolchain/r3 -e ~/r3-toolchain/foreman
 uv pip install --python ~/r3-toolchain/.venv/bin/python \
-  click pyyaml executor tqdm    # xr3 needs click/pyyaml/executor; xr3-slurm also tqdm
+  click pyyaml executor tqdm boto3   # xr3 needs click/pyyaml/executor; xr3-slurm also tqdm; xr3-sky also boto3
 ```
 
 (swap `uv pip install --python <venv>/bin/python` for `pip install` inside an activated conda
@@ -184,7 +184,9 @@ exec ~/r3-toolchain/.venv/bin/python \
   /path/to/r3-tooling/extensions/xr3-slurm/xr3-slurm "$@"
 ```
 
-`chmod +x` all four, then put that dir on `PATH` in `~/.bashrc` (after `$LUSTREWORK` is
+(`xr3-sky` is the same shape, pointing at `extensions/xr3-sky/xr3-sky`.)
+
+`chmod +x` all of them, then put that dir on `PATH` in `~/.bashrc` (after `$LUSTREWORK` is
 defined):
 
 ```bash
@@ -239,9 +241,10 @@ of truth.
 ## 5. Verify
 
 ```bash
-which r3 xr3 xr3-slurm foreman   # -> your bin dir
+which r3 xr3 xr3-slurm xr3-sky foreman   # -> your bin dir
 xr3 --help                       # workflow verbs (find/history/diff/check/commit/dev-*)
 xr3-slurm --help                 # submit / status / watch
+xr3-sky --help                   # launch / pull / status / logs / cancel (SkyPilot)
 # from a non-shell caller, the case a function fails:
 python3 -c "import subprocess; subprocess.run(['xr3','--help'])"
 ```
@@ -266,5 +269,6 @@ your `--r3-repo`, `<bin-dir>` to your `--bin-dir` — the installer fills these 
 See **[extensions/CONTRACT.md](extensions/CONTRACT.md)** — the single source of truth
 (the `output/done` marker, `tags[0]`/`metadata.path` conventions, `R3_REPOSITORY`, SLURM
 config, GNU `diff`, …), each with *what breaks if you don't*. The per-tool
-[`xr3`](extensions/xr3/README.md) / [`xr3-slurm`](extensions/xr3-slurm/README.md) READMEs
-are the command reference.
+[`xr3`](extensions/xr3/README.md) / [`xr3-slurm`](extensions/xr3-slurm/README.md) /
+[`xr3-sky`](extensions/xr3-sky/README.md) READMEs are the command reference; `xr3-sky`'s
+one-time setup (S3 profile, VPN, `sky-up`) is in its README.

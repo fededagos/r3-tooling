@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh — set up (or update) the full r3 toolchain: r3 + xr3/xr3-slurm + foreman.
+# install.sh — set up (or update) the full r3 toolchain: r3 + xr3/xr3-slurm/xr3-sky + foreman.
 # Idempotent: re-running updates in place. Every prompt has a matching flag; a fully
 # flagged (or --yes) invocation runs with no prompts and doubles as the update command.
 set -euo pipefail
@@ -69,6 +69,7 @@ SLURM:
 
 Skill:
   --install-skill / --no-install-skill   --skill-target all|claude|codex
+                         (links skills/r3 and skills/xr3-sky)
 
 Agent context (point agents at RESEARCH_WORKFLOW.md via a CLAUDE.md @import):
   --import-context / --no-import-context   --context-claude-md PATH  (default ~/.claude/CLAUDE.md)
@@ -173,7 +174,7 @@ interactive_config() {
   # Skill decision (resolve "prompt" -> yes/no now, so it happens before any relocate).
   if [ "$INSTALL_SKILL" = "prompt" ]; then
     if [ "$INTERACTIVE" -eq 1 ]; then
-      local a=""; read -r -p "  install the r3 agent skill for claude/codex? (yes/no) [yes]: " a < /dev/tty || true
+      local a=""; read -r -p "  install the agent skills (r3, xr3-sky) for claude/codex? (yes/no) [yes]: " a < /dev/tty || true
       case "${a:-yes}" in y|Y|yes|YES) INSTALL_SKILL=yes;; *) INSTALL_SKILL=no;; esac
     else
       INSTALL_SKILL=yes
@@ -313,11 +314,11 @@ phase_venv() {
   info "venv: $VENV_DIR (python $PYTHON_VERSION)"
   [ -d "$VENV_DIR" ] || run uv venv --python "$PYTHON_VERSION" "$VENV_DIR" \
     || { err "failed to create venv at $VENV_DIR"; exit 1; }
-  info "installing r3 + foreman (editable) + xr3 deps"
+  info "installing r3 + foreman (editable) + xr3 deps (incl. boto3 for xr3-sky)"
   run uv pip install --python "$VENV_DIR/bin/python" \
     -e "$TOOLCHAIN_ROOT/r3" -e "$TOOLCHAIN_ROOT/foreman" \
     || { err "editable install of r3/foreman failed"; exit 1; }
-  run uv pip install --python "$VENV_DIR/bin/python" click pyyaml executor tqdm \
+  run uv pip install --python "$VENV_DIR/bin/python" click pyyaml executor tqdm boto3 \
     || { err "install of xr3 deps failed"; exit 1; }
 }
 # phase_foreman_frontend: build foreman's web UI (npm deps + Tailwind CSS). Mirrors
@@ -377,6 +378,7 @@ phase_wrappers() {
   write_wrapper foreman   "exec \"$VENV_DIR/bin/foreman\" \"\$@\""
   write_wrapper xr3       "exec \"$py\" \"$REPO_DIR/extensions/xr3/xr3\" \"\$@\""
   write_wrapper xr3-slurm "exec \"$py\" \"$REPO_DIR/extensions/xr3-slurm/xr3-slurm\" \"\$@\""
+  write_wrapper xr3-sky   "exec \"$py\" \"$REPO_DIR/extensions/xr3-sky/xr3-sky\" \"\$@\""
   ensure_bashrc_block "r3-toolchain PATH" "export PATH=\"$BIN_DIR:\$PATH\""
   info "added $BIN_DIR to PATH in ~/.bashrc (run: source ~/.bashrc)"
 }
@@ -447,19 +449,25 @@ phase_skill() {
   # INSTALL_SKILL is resolved to yes/no in interactive_config (or by a flag).
   [ "$INSTALL_SKILL" = "yes" ] || { info "skill install: skipped"; return; }
 
-  local src="$REPO_DIR/skills/r3"
-  link_skill() { # AGENT_DIR
-    local d="$1"
-    [ -d "$d" ] || { info "skill: $d absent, skipping"; return; }
-    if [ -e "$d/r3" ] && [ ! -L "$d/r3" ]; then warn "skill: $d/r3 exists and is not a symlink; skipping"; return; fi
-    run ln -sfn "$src" "$d/r3" || { warn "could not link skill into $d"; return; }
-    info "skill linked -> $d/r3"
+  # skills/r3 is the pure r3 skill; skills/xr3-sky is the house skill for the
+  # xr3-sky SkyPilot launcher. Both link into the same agent skill dirs.
+  link_skill() { # AGENT_DIR SKILL_NAME
+    local d="$1" name="$2" src="$REPO_DIR/skills/$2"
+    [ -d "$d" ] || { info "skill: $d absent, skipping $name"; return; }
+    if [ -e "$d/$name" ] && [ ! -L "$d/$name" ]; then warn "skill: $d/$name exists and is not a symlink; skipping"; return; fi
+    run ln -sfn "$src" "$d/$name" || { warn "could not link skill $name into $d"; return; }
+    if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) would link skill -> $d/$name"; else info "skill linked -> $d/$name"; fi
   }
+  local dirs=()
   case "$SKILL_TARGET" in
-    claude) link_skill "$HOME/.claude/skills";;
-    codex)  link_skill "$HOME/.codex/skills";;
-    all|*)  link_skill "$HOME/.claude/skills"; link_skill "$HOME/.codex/skills";;
+    claude) dirs=("$HOME/.claude/skills");;
+    codex)  dirs=("$HOME/.codex/skills");;
+    all|*)  dirs=("$HOME/.claude/skills" "$HOME/.codex/skills");;
   esac
+  local d name
+  for d in "${dirs[@]}"; do
+    for name in r3 xr3-sky; do link_skill "$d" "$name"; done
+  done
 }
 # phase_agent_context: point agents at the workflow. Always prints the @import line;
 # adds it to a CLAUDE.md only when opted in (interactive yes, or --import-context).
@@ -500,16 +508,16 @@ EOF
 phase_verify() {
   info "verify"
   if [ "$DRY_RUN" -eq 1 ]; then
-    printf '  [dry-run] would run: <bin>/{r3,xr3,xr3-slurm,foreman} --help + a PATH subprocess check\n'
+    printf '  [dry-run] would run: <bin>/{r3,xr3,xr3-slurm,xr3-sky,foreman} --help + a PATH subprocess check\n'
   else
     local ok=1
     # Check the wrappers we just wrote by ABSOLUTE PATH. Resolving bare names
     # here would hit any r3/xr3 shell functions in the caller's environment
     # (which can even `exec`, replacing this process mid-verify).
-    for t in r3 xr3 xr3-slurm foreman; do
+    for t in r3 xr3 xr3-slurm xr3-sky foreman; do
       if [ -x "$BIN_DIR/$t" ]; then info "found $t -> $BIN_DIR/$t"; else err "missing wrapper: $BIN_DIR/$t"; ok=0; fi
     done
-    for t in xr3 xr3-slurm; do
+    for t in xr3 xr3-slurm xr3-sky; do
       "$BIN_DIR/$t" --help >/dev/null 2>&1 && info "$t --help ok" || { err "$t --help failed"; ok=0; }
     done
     # subprocess resolution via PATH (execvp ignores shell functions/aliases):
