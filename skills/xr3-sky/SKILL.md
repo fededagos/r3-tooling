@@ -23,7 +23,8 @@ Check all three before `launch`; each failure has a one-line message:
 
 - **Stanford VPN** up, for any S3 traffic (`launch`, `launch --dry`, `pull`).
   Message: `S3 unreachable — connect to the Stanford VPN`.
-- **`sky-up`** run, for the SkyPilot API (`launch`, `status`, `logs`, `cancel`).
+- **`sky-up`** run, for the SkyPilot API (`launch`, `logs`, `cancel`; `status` degrades
+  without it and shows `?` for the managed state).
   Message: `SkyPilot API unreachable — run sky-up`.
 - **`R3_REPOSITORY`** set. Also `sky.user` in `~/.config/xr3.yaml` or `$SKYPILOT_USER`.
 
@@ -82,6 +83,10 @@ The S3 copy of `output/done` decides; the local copy counts only when S3 has non
   failures** (an S3 hiccup, a failed `uv sync` download). Read `logs`; if the cause was
   transient, `launch -r`; if it was the job, fix it and commit a new version.
 - Preemption and `cancel` never write `failed`; SkyPilot resumes a preempted job.
+- A failure in SkyPilot's `setup:` phase (installing uv, r3 or the AWS CLI) never reaches
+  the bootstrap, so it writes **no** `failed` marker; only `run:` does. The managed job
+  shows `FAILED_SETUP` in `status` while the done state stays as it was; read
+  `xr3-sky logs <id> --controller` (and `xr3-sky logs <id>`), fix, and relaunch.
 
 ## Outputs
 
