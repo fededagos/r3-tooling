@@ -229,3 +229,81 @@ def test_bootstrap_git_bundles_two_commits_same_repo(tmp_path):
         clone.mkdir()
         _git("init", "-q", cwd=clone)
         _git("fetch", "-q", "--depth=1", str(bare), c, cwd=clone)
+
+
+def test_bootstrap_failed_final_sync_never_uploads_completed(tmp_path):
+    env = setup(tmp_path)
+    env["FAKE_AWS_UPLOAD_SYNC_RC"] = "1"   # every upload sync fails, periodic and final
+    env["XR3SKY_RETRY_DELAY"] = "0"
+    r = run(env)
+    assert r.returncode == 1, r.stderr
+    assert "final output sync failed" in r.stderr
+    assert not (remote_output(tmp_path) / "done").exists()
+    assert not (s3(tmp_path) / "jobs" / JOB / "output.complete").exists()
+
+
+def _s3_calls(tmp_path):
+    """(index, verb, src, dst, argv) for each logged `s3 cp|sync` call."""
+    out = []
+    for i, line in enumerate((tmp_path / "aws.log").read_text().splitlines()):
+        tok = line.split()
+        j = tok.index("s3")
+        if tok[j + 1] in ("cp", "sync"):
+            out.append((i, tok[j + 1], tok[j + 2], tok[j + 3], line))
+    return out
+
+
+def test_bootstrap_done_uploaded_separately_after_sync(tmp_path):
+    env = setup(tmp_path)
+    r = run(env)
+    assert r.returncode == 0, r.stderr
+    calls = _s3_calls(tmp_path)
+    up_syncs = [c for c in calls if c[1] == "sync" and c[3].startswith("s3://")]
+    assert up_syncs and all("--exclude done" in c[4] for c in up_syncs)
+    done_cp = [c[0] for c in calls if c[1] == "cp" and c[3].endswith(f"{JOB}/output/done")]
+    complete_cp = [c[0] for c in calls if c[1] == "cp" and c[3].endswith("output.complete")]
+    assert len(done_cp) == 1 and len(complete_cp) == 1
+    assert max(c[0] for c in up_syncs) < done_cp[0] < complete_cp[0]
+
+
+def test_bootstrap_prior_failed_is_not_success(tmp_path):
+    env = setup(tmp_path, run_inner="echo ran > output/ran.txt\n")
+    out = remote_output(tmp_path)
+    out.mkdir(parents=True)
+    (out / "done").write_text("failed\n")
+    r = run(env)
+    assert r.returncode == 1, r.stderr
+    assert "not 'completed'" in r.stderr
+    assert (out / "done").read_text().strip() == "failed"
+    assert not (out / "ran.txt").exists()   # run.sh's guard skipped the job
+    assert not (s3(tmp_path) / "jobs" / JOB / "output.complete").exists()
+
+
+def test_bootstrap_completed_without_complete_marker_gets_certified(tmp_path):
+    env = setup(tmp_path, run_inner="exit 9\n")   # must not run
+    out = remote_output(tmp_path)
+    out.mkdir(parents=True)
+    (out / "result.txt").write_text("r")
+    (out / "done").write_text("completed\n")
+    r = run(env)
+    assert r.returncode == 0, r.stderr
+    assert (out / "done").read_text().strip() == "completed"
+    assert (s3(tmp_path) / "jobs" / JOB / "output.complete").exists()
+
+
+def test_bootstrap_sync_skipped_files_is_a_warning(tmp_path):
+    env = setup(tmp_path)
+    env["FAKE_AWS_UPLOAD_SYNC_RC"] = "2"
+    r = run(env)
+    assert r.returncode == 0, r.stderr
+    assert "aws exit 2" in r.stderr
+    assert (remote_output(tmp_path) / "x.txt").exists()
+    assert (s3(tmp_path) / "jobs" / JOB / "output.complete").exists()
+
+
+def test_bootstrap_rejects_malformed_git_triple(tmp_path):
+    env = setup(tmp_path)
+    env["XR3SKY_GIT"] = "abc:git/github.com/u/r:" + "0" * 40
+    r = run(env)
+    assert r.returncode != 0
+    assert "bad sha256 digest" in r.stderr
