@@ -53,6 +53,29 @@ def _store(cfg: dict) -> s3.Store:
     except ImportError:
         raise click.ClickException("boto3 is not installed in this environment — "
                                    "re-run the r3-tooling installer")
+    except Exception as e:
+        if type(e).__name__ == "ProfileNotFound":  # botocore.exceptions.ProfileNotFound
+            raise click.ClickException(_credentials_msg(cfg))
+        raise
+
+
+def _credentials_msg(cfg: dict) -> str:
+    return (f"S3 credentials missing or invalid for profile '{cfg.get('aws_profile')}' "
+            "— see the README's setup section")
+
+
+def _ping(store, cfg: dict) -> None:
+    """store.ping() with credential and bucket errors turned into one-line fixes.
+
+    StoreUnreachable propagates: callers decide (fail with the VPN hint, or degrade).
+    """
+    try:
+        store.ping()
+    except s3.StoreAuthError:
+        raise click.ClickException(_credentials_msg(cfg))
+    except s3.StoreBucketMissing:
+        raise click.ClickException(
+            f"bucket '{cfg.get('bucket')}' not found on {cfg.get('endpoint')}")
 
 
 def _build_query(tags, queries) -> dict:
@@ -84,12 +107,13 @@ def _sky_bin() -> str:
     return sky
 
 
-def _preflight(store, need_sky: bool) -> None:
-    """Fail fast with a one-line fix: R3_REPOSITORY, S3 reachability, sky API."""
+def _preflight(store, need_sky: bool, cfg: dict) -> None:
+    """Fail fast with a one-line fix: R3_REPOSITORY, S3 reachability and
+    credentials, bucket, sky API."""
     if not os.environ.get("R3_REPOSITORY"):
         raise click.ClickException("R3_REPOSITORY is not set")
     try:
-        store.ping()
+        _ping(store, cfg)
     except s3.StoreUnreachable:
         raise click.ClickException("S3 unreachable — connect to the Stanford VPN")
     if need_sky:
@@ -501,7 +525,7 @@ def launch(job_ids, tags, queries, dry, infra, whole_card, allow_high, restart_f
     """Launch jobs on SkyPilot, selected by JOB_IDS and/or --tag/--query."""
     sky_cfg = _sky_config()
     store = _store(sky_cfg)
-    _preflight(store, need_sky=not dry)
+    _preflight(store, need_sky=not dry, cfg=sky_cfg)
     try:
         user = lib.sky_user(sky_cfg, os.environ)
     except ValueError as e:
@@ -622,7 +646,7 @@ def pull(job_ids, tags, queries, max_size, all_files):
     """Download job outputs from S3 into the local r3 repository."""
     sky_cfg = _sky_config()
     store = _store(sky_cfg)
-    _preflight(store, need_sky=False)
+    _preflight(store, need_sky=False, cfg=sky_cfg)
     try:
         max_bytes = None if all_files else lib.parse_size(
             max_size if max_size is not None else sky_cfg["pull_max_size"])
@@ -696,7 +720,7 @@ def status(globs):
     store = _store(sky_cfg)
     reachable = True
     try:
-        store.ping()
+        _ping(store, sky_cfg)
     except s3.StoreUnreachable:
         reachable = False
         print("(S3 unreachable — done column from local markers only)")

@@ -221,3 +221,35 @@ def test_status_read_error_degrades(env, monkeypatch):
     r = run("status")
     assert r.exit_code == 0, r.output
     assert "S3 unreachable" in r.output
+
+
+CRED_MSG = ("S3 credentials missing or invalid for profile 'enigma' "
+            "— see the README's setup section")
+
+
+@pytest.mark.parametrize("cmd", [["launch", "--dry"], ["pull"], ["status"]])
+@pytest.mark.parametrize("exc, msg", [
+    (s3.StoreAuthError("403"), CRED_MSG),
+    (s3.StoreBucketMissing("404"),
+     "bucket 'federico-r3' not found on https://rgw-cold.enigmatic.stanford.edu"),
+])
+def test_ping_auth_and_bucket_errors_are_clean(env, cmd, exc, msg):
+    def bad():
+        raise exc
+    env["store"].ping = bad
+    args = cmd + ([env["main"]] if cmd[0] != "status" else [])
+    r = run(*args)
+    assert r.exit_code != 0
+    assert msg in r.output
+    assert "Traceback" not in r.output
+
+
+def test_store_missing_profile_is_clean_error(monkeypatch):
+    class ProfileNotFound(Exception):
+        pass
+
+    def boom(*a, **k):
+        raise ProfileNotFound("enigma")
+    monkeypatch.setattr(cli_mod.s3, "BotoStore", boom)
+    with pytest.raises(cli_mod.click.ClickException, match="credentials missing or invalid"):
+        cli_mod._store({"bucket": "b", "endpoint": "e", "aws_profile": "enigma"})

@@ -19,6 +19,14 @@ class StoreUnreachable(Exception):
     pass
 
 
+class StoreAuthError(Exception):
+    """Credentials missing, incomplete or rejected (e.g. 403)."""
+
+
+class StoreBucketMissing(Exception):
+    """The configured bucket does not exist on the endpoint (404 / NoSuchBucket)."""
+
+
 class PushError(Exception):
     pass
 
@@ -75,6 +83,12 @@ class MemoryStore:
         return len(keys)
 
 
+# head_bucket has no body, so errors often carry only the HTTP status as the code.
+_AUTH_CODES = {"403", "AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch",
+               "Forbidden"}
+_MISSING_BUCKET_CODES = {"404", "NoSuchBucket", "NotFound"}
+
+
 class BotoStore:
     def __init__(self, bucket: str, endpoint: str, profile: Optional[str] = None):
         import boto3
@@ -92,6 +106,15 @@ class BotoStore:
         except (be.EndpointConnectionError, be.ConnectionClosedError,
                 be.ConnectTimeoutError, be.ReadTimeoutError, be.SSLError) as e:
             raise StoreUnreachable(str(e)) from e
+        except (be.NoCredentialsError, be.PartialCredentialsError) as e:
+            raise StoreAuthError(str(e)) from e
+        except be.ClientError as e:
+            code = str(e.response.get("Error", {}).get("Code", ""))
+            if code in _AUTH_CODES:
+                raise StoreAuthError(str(e)) from e
+            if code in _MISSING_BUCKET_CODES:
+                raise StoreBucketMissing(str(e)) from e
+            raise
 
     def exists(self, key):
         import botocore.exceptions as be

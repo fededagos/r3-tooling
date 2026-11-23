@@ -234,3 +234,47 @@ def test_plan_push_dep_files_pushed_even_if_output_remote(tmp_path):
     assert "r3/jobs/dep1/files/r3.yaml" in keys
     assert not any(k.startswith("r3/jobs/dep1/output/") for k in keys)
     assert "r3/jobs/dep1/files.complete" in p.complete_markers
+
+
+# --- BotoStore.ping error mapping (stub client; botocore needed) ----------------
+
+def _stub_store(exc):
+    pytest.importorskip("botocore")
+
+    class Client:
+        def head_bucket(self, Bucket):
+            raise exc
+
+    store = object.__new__(s3.BotoStore)
+    store.bucket = "b"
+    store.client = Client()
+    return store
+
+
+def _client_error(code):
+    from botocore.exceptions import ClientError
+    return ClientError({"Error": {"Code": code, "Message": "x"}}, "HeadBucket")
+
+
+@pytest.mark.parametrize("make, expected", [
+    (lambda be: be.NoCredentialsError(), "StoreAuthError"),
+    (lambda be: be.PartialCredentialsError(provider="p", cred_var="v"), "StoreAuthError"),
+    (lambda be: _client_error("403"), "StoreAuthError"),
+    (lambda be: _client_error("InvalidAccessKeyId"), "StoreAuthError"),
+    (lambda be: _client_error("404"), "StoreBucketMissing"),
+    (lambda be: _client_error("NoSuchBucket"), "StoreBucketMissing"),
+    (lambda be: be.EndpointConnectionError(endpoint_url="https://x"), "StoreUnreachable"),
+])
+def test_boto_ping_maps_errors(make, expected):
+    be = pytest.importorskip("botocore.exceptions")
+    store = _stub_store(make(be))
+    with pytest.raises(getattr(s3, expected)):
+        store.ping()
+
+
+def test_boto_ping_reraises_other_client_errors():
+    pytest.importorskip("botocore")
+    store = _stub_store(_client_error("500"))
+    from botocore.exceptions import ClientError
+    with pytest.raises(ClientError):
+        store.ping()

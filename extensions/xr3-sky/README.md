@@ -270,6 +270,10 @@ file) is `completed`.
   non-zero and no marker exists, the pod writes `failed` before the final sync. A
   termination signal (preemption, `cancel`) never marks `failed`: SkyPilot recovers a
   preempted job, and the new pod resumes from the last sync.
+  A failure in SkyPilot's `setup:` phase (installing uv, r3 or the AWS CLI) happens
+  before the bootstrap runs, so it marks nothing: the managed job shows `FAILED_SETUP`,
+  the done state is unchanged, and a plain `launch` retries. Read
+  `xr3-sky logs <id> --controller` to see why.
 - **`output.complete`** is written only after a `completed` job's output is fully in S3.
   Downstream launches rely on it to skip re-pushing that output.
 
@@ -369,7 +373,8 @@ r3 job id.
 | `boto3 is not installed in this environment — re-run the r3-tooling installer` | Re-run the installer (`update.sh`), or `uv pip install --python ~/r3-toolchain/.venv/bin/python boto3`. |
 | `AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY not set and boto3 is not installed` | As above. |
 | `no AWS credentials in profile 'enigma'` / `AWS profile 'enigma': …` | Add the `[enigma]` key to `~/.aws/credentials` (see Setup). |
-| A traceback from `head_bucket` (`403`, `NoCredentialsError`, `NoSuchBucket`) | The profile has no or wrong credentials, or `sky.bucket` is not yours. Fix `~/.aws/credentials` or `sky.bucket`. |
+| `S3 credentials missing or invalid for profile 'enigma' — see the README's setup section` | The profile is missing, has no key, or the RGW rejected it (403). Fix `~/.aws/credentials` / `~/.aws/config` (see Setup), or `sky.aws_profile`. |
+| `bucket 'federico-r3' not found on https://rgw-cold.enigmatic.stanford.edu` | `sky.bucket` (or `sky.endpoint`) is wrong: set it to your own bucket. |
 | `cannot determine the r3 commit in <dir>: …` | r3 must be a git checkout (the installer's editable install is). |
 
 **Selecting jobs**
