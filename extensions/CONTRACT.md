@@ -1,6 +1,6 @@
 # CONTRACT — what the extensions assume about your r3 jobs
 
-**Read this before using `xr3` / `xr3-slurm` on your jobs.** Bare [r3](https://github.com/mtangemann/r3)
+**Read this before using `xr3` / `xr3-slurm` / `xr3-sky` on your jobs.** Bare [r3](https://github.com/mtangemann/r3)
 makes almost no assumptions about a job's contents. The house tools in `extensions/` add a few — they buy
 you real convenience (see each tool's README for the pitch), but a job that violates an assumption will
 make the relevant command fail or misbehave. This file is the **single source of truth** for those
@@ -15,11 +15,12 @@ itself — only by these tools.
 
 - **`R3_REPOSITORY` points at your r3 repo.** Set the env var (some commands also accept `--repository` or
   a `REPOSITORY_PATH` argument). Nearly everything needs it: all of `xr3` except `files`, and `xr3-slurm`
-  `submit`/`status`/`watch --tag` — the one exception is plain `xr3-slurm watch <name/id>`, which talks only
-  to SLURM. *Breaks:* the command errors without it — `dev-checkout`/`dev-cleanup`/`git-check` with a clean
+  `submit`/`status`/`watch --tag`, and `xr3-sky` `launch`/`pull`/`status` — the exceptions are plain
+  `xr3-slurm watch <name/id>`, which talks only to SLURM, and `xr3-sky logs`/`cancel`, which talk only to
+  SkyPilot. *Breaks:* the command errors without it — `dev-checkout`/`dev-cleanup`/`git-check` with a clean
   "Missing argument 'REPOSITORY_PATH'", the rest (including `diff`, `find`, `check`) with a raw traceback.
 - **Python 3 + runtime deps on `PYTHONPATH`.** `xr3` needs `click`, `pyyaml`, `r3`, `executor`; `xr3-slurm`
-  additionally needs `tqdm`. *Breaks:* `ImportError` at startup. (Both tools are single-file scripts run
+  additionally needs `tqdm`; `xr3-sky` needs `boto3` (and the `sky` CLI on `PATH`). *Breaks:* `ImportError` at startup. (Both tools are single-file scripts run
   through your r3 Python environment.)
 
 ## For the pathmap-dependent workflow commands (`history`, `diff`, `check`, `commit`)
@@ -69,6 +70,53 @@ itself — only by these tools.
 - **Jobs `xr3-slurm` submits are findable by their r3 id.** `submit` sets `--job-name=<r3 job id>`; `status`
   and `watch` correlate SLURM jobs back to r3 jobs by that name. *Breaks:* if you submit some other way
   without `--job-name=<r3 id>`, `status`/`watch` won't match those jobs.
+
+## For `xr3-sky` (SkyPilot managed jobs — lab Kubernetes)
+
+`xr3-sky` runs a committed job in a disposable pod, with Ceph S3 as the only state that
+outlives it (see [xr3-sky](xr3-sky/README.md)). What that demands of a job and a laptop:
+
+- **Committed jobs (dir named by UUID) with the house `run.sh`.** `launch` operates on committed job
+  directories and the pod runs `R3_REPOSITORY=<pod repo> bash run.sh` in the job dir, unchanged. The
+  house `run.sh` (`examples/compute-job/run.sh`) checks the job out via `r3 checkout` and runs
+  `run_inner.sh` with plain `bash` (no `SLURM_JOB_ID` in a pod). *Breaks:* "not a valid UUID" / "No run
+  script"; a `run.sh` that assumes SLURM, Singularity or a host path fails in the pod.
+- **`R3_REPOSITORY` is honoured, not hard-coded.** The pod builds a sparse repo at `$HOME/r3_repo`
+  holding only the job, its dependencies and its git dependencies, and sets `R3_REPOSITORY` to it.
+  *Breaks:* a job that reads other jobs by absolute path, or outside its declared dependencies, finds
+  nothing there.
+- **The environment comes from a uv lockfile.** `pyproject.toml` + `uv.lock` in the job (or a git
+  dependency), and `run_inner.sh` uses `uv sync --frozen` / `uv run`; see `examples/uv-job/`. *Breaks:*
+  `launch` refuses a job whose transitive dependencies include a container or venv environment job
+  (an output holding `container.sif` or `env/interpreter_path.txt`): those cannot run in a Linux pod.
+- **`sky.yaml` (optional) is a SkyPilot task fragment with only `resources`, `config`, `envs`,
+  `secrets`, `num_nodes`.** It is merged over `sky.defaults` and validated: a GPU job pins exactly one
+  accelerator; a HAMi-shared card (RTXPRO6000, H100-80GB, L40S) has a `nvidia.com/gpumem` cap unless
+  `--whole-card`; `config:` is top-level; `num_nodes` is 1; priority `high` needs `--allow-high`.
+  `secrets` holds names only. *Breaks:* `launch` refuses the job before writing anything.
+- **The `output/done` marker, with `failed`.** As for `xr3-slurm`: `run.sh` writes `output/done`
+  (`completed`) on success, and `launch` skips finished jobs, reruns `restart`, and reruns `failed` only
+  with `--restart-failed` (rewriting the marker to `restart`). In addition the pod **writes `failed`**
+  itself when `run.sh` exits non-zero without a marker, and the S3 copy of the marker wins over the local
+  one. *Breaks:* without the marker every `launch` reruns the job, `pull` treats it as in progress and
+  downloads nothing, and the pod fails a run that exits 0 without `completed`.
+- **Partial output survives a relaunch.** The pod restores `output/` from S3 before `run.sh` starts, so
+  resuming from checkpoints is the job's business (and a job that wants a clean slate clears its own
+  output, or you pass `--fresh`). *Breaks:* a job that assumes an empty `output/` may mix runs.
+- **S3 access from the laptop: the Stanford VPN plus the `sky.aws_profile` credentials.** `launch`
+  pushes and `pull` downloads through the Ceph RGW, which the laptop reaches only on the VPN.
+  *Breaks:* "S3 unreachable — connect to the Stanford VPN". Monitoring (`status`, `logs`, `cancel`)
+  needs only the Teleport tunnel (`sky-up`).
+- **Dependencies are finished and present.** Every job dependency has output locally (with
+  `output/done`) or complete in S3; git dependencies are pinned to a commit present in the local
+  mirror. *Breaks:* `launch` names the dependency and refuses (`--allow-unfinished-deps` pushes an
+  unfinished one on purpose).
+- **Secrets travel as names.** Values come from the laptop environment (AWS from the profile) and are
+  passed with `sky jobs launch --secret`. *Breaks:* a secret placed in `envs:` or a job file is written
+  to S3 in clear text.
+- **Managed jobs are named `<user>-r3-<first 8 chars of the r3 id>`**, with the user from `sky.user` or
+  `$SKYPILOT_USER`. `status`, `logs` and `cancel` find jobs by that name. *Breaks:* a job launched
+  another way is invisible to them.
 
 ## For `xr3 diff`
 

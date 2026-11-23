@@ -14,6 +14,10 @@ pure skill stays upstream-ready.
   `xr3pathmap.py`, `xr3diff.py`.)
 - **[`xr3-slurm/`](xr3-slurm/README.md)** — **MLCloud-specific** SLURM submission & observation:
   `submit`, `status`, `watch` (absorbs `sattachx`/`sattachx_wait`). (`xr3-slurm` + `xr3slurmlib.py`.)
+- **[`xr3-sky/`](xr3-sky/README.md)** — **SkyPilot / lab-Kubernetes** launcher (`at`, `morpho`, `DO`):
+  `launch`, `pull`, `status`, `logs`, `cancel`. Runs committed jobs as SkyPilot managed jobs, moving
+  inputs and outputs through Ceph S3; the job's resources live in a versioned `sky.yaml`. (`xr3-sky` +
+  `xr3skylib.py`, `xr3skys3.py`, `xr3sky_bootstrap.sh`.)
 - **`scripts/run_job_locally`** — run a job's `run.sh` and capture its log, on the cluster or off: `cd`s
   into the job dir and runs `run.sh`, teeing stdout+stderr to `output/run_manual_<timestamp>.log`. It sets
   and exports `$SCRATCH` (node-local SLURM scratch in an allocation, else a `mktemp -d`) so the job checks
@@ -24,8 +28,8 @@ pure skill stays upstream-ready.
   these tools are actually used day to day. The place for *prescriptions* ("run a dev-checkout smoke test",
   "submit via `xr3-slurm`"), as opposed to this file's *assumptions*.
 
-The two tools share one config file (`~/.config/xr3.yaml`, or `$XR3_CONFIG`); each reads only its own
+The tools share one config file (`~/.config/xr3.yaml`, or `$XR3_CONFIG`); each reads only its own
 sections. Copy [`xr3/xr3.example.yaml`](xr3/xr3.example.yaml) to start.
 
-Rule of thumb: if it mentions `xr3`, a container, SLURM, `g`, or a house convention, it's an extension; if
+Rule of thumb: if it mentions `xr3`, a container, SLURM, SkyPilot, `g`, or a house convention, it's an extension; if
 it's true of vanilla r3, it belongs in the pure skill.

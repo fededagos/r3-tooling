@@ -1,7 +1,7 @@
 # r3-tooling
 
 **r3-tooling** is the house toolchain around [r3](https://github.com/mtangemann/r3): an
-agent-facing **r3 skill**, the **`xr3` / `xr3-slurm`** command-line tools, the house
+agent-facing **r3 skill**, the **`xr3` / `xr3-slurm` / `xr3-sky`** command-line tools, the house
 **`RESEARCH_WORKFLOW.md`** conventions, and a one-command **installer** that wires it all up
 (r3 + xr3/xr3-slurm + foreman). Use the whole toolchain — or just the skill.
 
@@ -15,7 +15,7 @@ curl -fsSL https://raw.githubusercontent.com/matthias-k/r3-tooling/main/bootstra
 
 It prompts for the toolchain directory and the other settings — locations, SLURM head node,
 whether to install the agent skill, and whether to wire the workflow into your `CLAUDE.md` —
-then installs: a `uv` venv with r3 + foreman, the `r3` / `xr3` / `xr3-slurm` / `foreman`
+then installs: a `uv` venv with r3 + foreman, the `r3` / `xr3` / `xr3-slurm` / `xr3-sky` / `foreman`
 commands on your `PATH`, an `xr3.yaml`, and an initialized `R3_REPOSITORY`. It prompts **even
 when piped** (`curl … | bash`), reading from your terminal; pass `--yes` to run unattended
 with all defaults, or `--dry-run` to preview. With no terminal and no `--yes` it errors
@@ -38,12 +38,14 @@ confusion. Full details — flags, manual steps, SLURM, the foreman tunnel — a
 - **[`skills/r3/`](skills/r3/)** — the **r3 skill**: lets an agent operate r3 reliably
   (author jobs, wire dependencies, commit/checkout, query the job graph, trace provenance).
   Self-contained and usable on its own (see *Using the r3 skill on its own*).
-- **[`extensions/`](extensions/README.md)** — the **`xr3` / `xr3-slurm`** command-line suite
-  (the house dev + SLURM workflow), plus **[`CONTRACT.md`](extensions/CONTRACT.md)** — the
+- **[`extensions/`](extensions/README.md)** — the **`xr3` / `xr3-slurm` / `xr3-sky`** command-line
+  suite (the house dev workflow, SLURM, and SkyPilot on the lab's Kubernetes clusters), plus **[`CONTRACT.md`](extensions/CONTRACT.md)** — the
   assumptions these tools place on your jobs.
 - **[`RESEARCH_WORKFLOW.md`](RESEARCH_WORKFLOW.md)** — the house research workflow: how we
   actually use r3/xr3 (project & path layout, `SPEC.md`→`PLAN.md`→implement, job archetypes,
   `run.sh`/environment, reports, gotchas).
+- **[`skills/xr3-sky/`](skills/xr3-sky/SKILL.md)** — a house agent skill for running r3 jobs on
+  SkyPilot with `xr3-sky` (installed next to the r3 skill; kept separate so `skills/r3/` stays pure).
 - **[`agent-context.md`](agent-context.md)** — a short pointer you `@`-import into a
   `CLAUDE.md` so agents auto-discover the workflow (the installer can wire this for you).
 - **[`examples/`](examples/README.md)** — copy-and-adapt starting points for the pieces
@@ -77,7 +79,7 @@ out jobs, the Python API, tracing lineage — or you can invoke it explicitly.
   conventions — how the tools are actually used — live in the top-level [`RESEARCH_WORKFLOW.md`](RESEARCH_WORKFLOW.md).) **These tools add assumptions to your r3 jobs — see
   [`extensions/CONTRACT.md`](extensions/CONTRACT.md).**
 
-## Extensions: the xr3 / xr3-slurm suite
+## Extensions: the xr3 / xr3-slurm / xr3-sky suite
 
 Vendored in [`extensions/`](extensions/README.md):
 
@@ -85,9 +87,11 @@ Vendored in [`extensions/`](extensions/README.md):
   `diff`, `check`, `commit`, `dev-checkout`/`dev-cleanup`, …).
 - **[`xr3-slurm`](extensions/xr3-slurm/README.md)** — MLCloud SLURM submission & observation (`submit`,
   `status`, `watch`).
+- **[`xr3-sky`](extensions/xr3-sky/README.md)** — SkyPilot managed jobs on the lab's Kubernetes clusters,
+  with Ceph S3 as transport (`launch`, `pull`, `status`, `logs`, `cancel`).
 
 **They place assumptions on your jobs** (a pathmap root, the `output/done` marker, `tags[0]`/`metadata.path`
-conventions, SLURM config, …). Those, and what breaks without them, are the single source of truth in
+conventions, SLURM config, `sky.yaml`, …). Those, and what breaks without them, are the single source of truth in
 **[`extensions/CONTRACT.md`](extensions/CONTRACT.md)** — read it before pointing the tools at your jobs.
 
 What's next (the `xr3` skill, more `examples/`) is in **[`ROADMAP.md`](ROADMAP.md)**.

@@ -30,7 +30,7 @@ mechanics it builds on live elsewhere, one home each:
 
 - **pure r3** (`r3.yaml`, `find_latest`/`find_all`, commit/checkout, the Python API,
   the query grammar) → the **r3 skill** (`skills/r3/`).
-- **how `xr3` / `xr3-slurm` work, and what they require of jobs** → the **r3-tooling
+- **how `xr3` / `xr3-slurm` / `xr3-sky` work, and what they require of jobs** → the **r3-tooling
   docs**: `extensions/CONTRACT.md` (the assumptions tools place on
   jobs — single source of truth) plus the per-tool READMEs.
 - **how *we* use all of it** (habits, house structure, the flows) → *this doc*.
@@ -57,9 +57,9 @@ split, archetypes, metadata conventions, the review loop) is environment-indepen
 
 1. **Project & path layout** — directory layout, the eponymous-subdir rule, `metadata` conventions.
 2. **Experiment structure** — `SPEC.md`→`PLAN.md`→implement; the compute/report split.
-3. **Job archetypes** — the kinds of job (compute, compute+report, provider/server, container, `_raw`/`src` entry nodes).
+3. **Job archetypes** — the kinds of job (compute, compute+report, provider/server, container, `_raw`/`src` entry nodes, pointer jobs).
 4. **Job structure & execution** — `run.sh`→`run_inner.sh`, singularity conventions, running a job locally.
-5. **Environment & containers** — SLURM scratch, container builds, working inside the container.
+5. **Environment & containers** — SLURM scratch, container builds, working inside the container, the uv-lockfile environment.
 6. **Finding jobs** — querying the index (`xr3 find` / `history`, the Python API).
 7. **Config & dependencies** — config-over-env, narrowing deps, on-disk caches, params-in-two-places.
 8. **Developing & committing** — the dev loop, pre-commit habits, clean git deps, upstreaming to a git dependency.
@@ -203,6 +203,16 @@ have a classical run file**. The archetypes in use:
   `datasets/CAT2000_raw`, `…/local_global_attention_model/src`. This is *the* documented
   way to depend on external data until r3 has a first-class option for it.
   Skeleton: [`examples/raw-data/`](examples/raw-data/).
+- **Pointer jobs** — when the external input should *stay* where it lives (too large to copy,
+  or owned by another system), the entry node holds a **pinned reference** instead of the
+  data. The principle: a dependency on external, mutable state is provenance only if it names
+  an exact version; "the table", "the latest run" or "the bucket path" names a moving target.
+  So the job (no run file, a `README.md`, like `_raw`) has an `output/pointer.yaml` with a
+  `kind` and the fields that pin a version (e.g. a Spiral table plus its `asof` time, a W&B
+  `artifact:version`, an S3 URI plus version id). Downstream jobs depend on it by `path`, read
+  the manifest and fetch the data themselves. A pin is only as durable as the store's
+  retention of old versions; where that is unknown (Spiral `asof` today), freeze a copy and
+  point at the copy. Skeleton: [`examples/pointer-job/`](examples/pointer-job/).
 - **Probe / spike jobs** — a job set up **exclusively to be dev-run**, to answer a question that
   shapes the *real* job's design: a speed/memory test, a "does this loader/model even work",
   a quick parameter sanity check. You build it with the normal job machinery (env + deps, so the
@@ -262,8 +272,9 @@ itself are in `extensions/CONTRACT.md`):
 
 ## Environment & containers
 
-**_(MLCloud/SLURM)_** — this whole section assumes the galvani SLURM + Singularity
-setup; a laptop or another cluster differs (see *Adapting this to your setup* at the top).
+**_(MLCloud/SLURM)_** — this section assumes the galvani SLURM + Singularity setup,
+except the last bullet; a laptop or another cluster differs (see *Adapting this to your
+setup* at the top).
 
 - **SLURM scratch.** Cluster nodes have node-local NVMe scratch at
   `/scratch_local/<user>-<SLURM_JOB_ID>/`; `$SCRATCH` points there inside a job. It is
@@ -280,6 +291,18 @@ setup; a laptop or another cluster differs (see *Adapting this to your setup* at
   working directory is typically under `$SCRATCH/job/` or a bind-mounted lustre path, and
   there are no `singularity`/`$SCRATCH`/SLURM binaries — which shapes how you test and
   submit (see *Developing & committing*).
+- **The uv-lockfile environment** _(portable)_. The principle behind every environment
+  choice here: the environment is a **versioned input of the job, in a form that travels to
+  wherever the job runs**. A container or venv job does that on galvani and the laptop. Where
+  those cannot follow (most often a disposable Linux pod: no Singularity, no macOS venv, as
+  with SkyPilot via `xr3-sky`), put the environment *in the job*: `pyproject.toml` + `uv.lock`
+  committed with it, and `run_inner.sh` doing `uv sync --frozen` / `uv run --frozen`. The
+  lock pins it exactly, uv rebuilds it in about a minute anywhere, and the same job still runs
+  on the laptop and under SLURM. It sits alongside the container/venv archetypes, not in
+  place of them: prefer it when the job must run off-cluster or in pods, keep an environment
+  job when one environment is shared by many jobs or needs system packages. Changing a
+  dependency means re-locking, i.e. a new job version. Skeleton:
+  [`examples/uv-job/`](examples/uv-job/); what `xr3-sky` requires: `extensions/CONTRACT.md`.
 
 ## Finding jobs
 
@@ -380,7 +403,8 @@ detail for everything above is in the r3-tooling tool READMEs
   needed. The wrapper pins the r3 install's environment, where `r3` is editable-installed.
   `$R3_REPOSITORY` must be set (once, at install/login — see `SETUP.md`). `xr3` is the
   cluster-agnostic dev workflow; `xr3-slurm` is SLURM submission/observation
-  _(MLCloud/SLURM)_. Setup + what the tools assume about jobs: `SETUP.md` and
+  _(MLCloud/SLURM)_; `xr3-sky` launches committed jobs on the lab's SkyPilot Kubernetes
+  clusters and pulls their outputs back (`extensions/xr3-sky/README.md`). Setup + what the tools assume about jobs: `SETUP.md` and
   `extensions/CONTRACT.md`.
 - **SLURM commands (`squeue`/`scancel`/`sacct` … and `sbatch`).** On a compute/bare node
   these run directly. **Inside a container** (no SLURM binaries — e.g. a VS Code remote
