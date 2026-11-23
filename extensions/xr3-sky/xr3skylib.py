@@ -1,6 +1,7 @@
 """Pure helpers for xr3-sky (stdlib only; unit-testable without sky/r3/boto3).
 
-Sections: sizes, identity & naming, S3 key layout, sky.yaml merge & validation.
+Sections: sizes, identity & naming, S3 key layout, done state & launch decision,
+sky.yaml merge & validation.
 """
 from __future__ import annotations
 
@@ -8,7 +9,7 @@ import copy
 import hashlib
 import re
 from dataclasses import dataclass
-from typing import Mapping, Optional
+from typing import Literal, Mapping, Optional
 
 # --- sizes -------------------------------------------------------------------
 
@@ -75,6 +76,40 @@ class S3Layout:
 
     def run_record(self, job_id: str, ts: str) -> str:
         return f"{self.prefix}/runs/{job_id}/{ts}/task.yaml"
+
+
+# --- done state & launch decision --------------------------------------------
+
+def _classify_done(text: str) -> str:
+    """Classify an `output/done` body; matches xr3slurmlib.parse_done_state."""
+    body = text.strip()
+    if body == "restart":
+        return "restart"
+    if body == "failed":
+        return "failed"
+    return "completed"
+
+
+def effective_done(s3_text: Optional[str], local_text: Optional[str]) -> Optional[str]:
+    """Done state from S3 if its marker exists, else local; None if neither.
+
+    An empty body is a present marker and counts as "completed".
+    """
+    if s3_text is not None:
+        return _classify_done(s3_text)
+    if local_text is not None:
+        return _classify_done(local_text)
+    return None
+
+
+def launch_decision(state: Optional[str], restart_failed: bool
+                    ) -> Literal["skip", "launch", "launch_rewrite_restart"]:
+    """Whether to (re)launch a job given its done state."""
+    if state is None or state == "restart":
+        return "launch"
+    if state == "failed":
+        return "launch_rewrite_restart" if restart_failed else "skip"
+    return "skip"
 
 
 # --- sky.yaml merge & validation ---------------------------------------------

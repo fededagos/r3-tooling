@@ -185,3 +185,30 @@ def test_merge_job_wins_and_deep_merges():
 def test_merge_rejects_owned_keys():
     with pytest.raises(lib.SkySpecError):
         lib.merge_task({}, {"run": "echo hi"})
+
+
+# --- done-state resolution and launch decision -------------------------------
+
+def test_effective_done_s3_wins():
+    assert lib.effective_done("failed\n", "completed\n") == "failed"
+    assert lib.effective_done(None, "completed\n") == "completed"
+    assert lib.effective_done(None, None) is None
+
+
+def test_effective_done_classifies_bodies():
+    assert lib.effective_done("restart\n", None) == "restart"
+    assert lib.effective_done("  failed  \n", None) == "failed"
+    assert lib.effective_done("anything else\n", None) == "completed"
+
+
+def test_effective_done_empty_marker_is_completed():
+    assert lib.effective_done("", None) == "completed"
+    assert lib.effective_done(None, "") == "completed"
+
+
+def test_launch_decision_table():
+    assert lib.launch_decision(None, False) == "launch"
+    assert lib.launch_decision("completed", True) == "skip"
+    assert lib.launch_decision("restart", False) == "launch"
+    assert lib.launch_decision("failed", False) == "skip"
+    assert lib.launch_decision("failed", True) == "launch_rewrite_restart"
