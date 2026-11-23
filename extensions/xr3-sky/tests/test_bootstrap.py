@@ -307,3 +307,29 @@ def test_bootstrap_rejects_malformed_git_triple(tmp_path):
     r = run(env)
     assert r.returncode != 0
     assert "bad sha256 digest" in r.stderr
+
+
+def test_bootstrap_git_bundle_with_only_xr3sky_ref(tmp_path):
+    """The CLI bundles via a temporary refs/xr3sky/<commit> ref; `git clone` of such
+    a bundle imports no objects, so the bootstrap must unbundle into a bare repo."""
+    import hashlib
+    env = setup(tmp_path)
+    src = tmp_path / "src"
+    src.mkdir()
+    _git("init", "-q", "-b", "main", cwd=src)
+    (src / "f.txt").write_text("x")
+    _git("add", ".", cwd=src)
+    _git("commit", "-q", "-m", "x", cwd=src)
+    c = subprocess.run(["git", "rev-parse", "HEAD"], cwd=src, text=True,
+                       capture_output=True, check=True).stdout.strip()
+    repo_path = "git/github.com/u/r"
+    digest = hashlib.sha256(repo_path.encode()).hexdigest()
+    gdir = s3(tmp_path) / "git" / digest
+    gdir.mkdir(parents=True)
+    _git("update-ref", f"refs/xr3sky/{c}", c, cwd=src)
+    _git("bundle", "create", str(gdir / f"{c}.bundle"), f"refs/xr3sky/{c}", cwd=src)
+    env["XR3SKY_GIT"] = f"{digest}:{repo_path}:{c}"
+    r = run(env)
+    assert r.returncode == 0, r.stderr
+    bare = tmp_path / "root" / repo_path
+    subprocess.run(["git", "-C", str(bare), "cat-file", "-e", f"{c}^{{commit}}"], check=True)

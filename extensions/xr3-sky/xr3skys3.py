@@ -147,6 +147,9 @@ class DepInfo:
     local_done: bool
     has_remote_yaml: bool
     env_marker: bool
+    # Committed job dir; its files (minus output/) go to layout.files(job_id) so
+    # r3's recursive checkout on the pod can read the dependency's r3.yaml.
+    job_dir: Optional[Path] = None
 
 
 @dataclass
@@ -195,6 +198,13 @@ def plan_push(job_id: str, job_dir: Path, deps: list[DepInfo],
         for p, rel in _tree(Path(job_dir), exclude_top="output"):
             plan.uploads.append((p, layout.files(job_id) + rel))
         plan.complete_markers.append(layout.files_complete(job_id))
+
+    for d in deps:
+        if d.job_dir is None or store.exists(layout.files_complete(d.job_id)):
+            continue
+        for p, rel in _tree(Path(d.job_dir), exclude_top="output"):
+            plan.uploads.append((p, layout.files(d.job_id) + rel))
+        plan.complete_markers.append(layout.files_complete(d.job_id))
 
     for d in deps:
         if d.has_remote_yaml or store.exists(layout.complete(d.job_id)):

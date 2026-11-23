@@ -239,12 +239,10 @@ for triple in $XR3SKY_GIT; do
     bundle="$TMPD/$commit.bundle"
     log "fetching git bundle for $repo_path@$commit"
     s3 cp "$S3_BASE/git/$digest/$commit.bundle" "$bundle" --only-show-errors
-    if [ -d "$dest" ]; then
-        git -C "$dest" bundle unbundle "$bundle" >/dev/null
-    else
-        mkdir -p "$(dirname "$dest")"
-        git clone --quiet --bare "$bundle" "$dest"
-    fi
+    # Unbundle rather than clone: `git clone` imports only refs/heads and tags, and
+    # xr3-sky bundles a bare commit via a refs/xr3sky/<commit> ref.
+    [ -d "$dest" ] || { mkdir -p "$dest"; git init --quiet --bare "$dest"; }
+    git -C "$dest" bundle unbundle "$bundle" >/dev/null
     # Pin the commit with a ref so `git fetch --depth=1 <dest> <commit>` can want it.
     git -C "$dest" update-ref "refs/xr3sky/$commit" "$commit" \
         || die "commit $commit not found in bundle for $repo_path"

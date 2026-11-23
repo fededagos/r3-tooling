@@ -1,0 +1,418 @@
+#!/usr/bin/env python3
+"""xr3-sky: launch committed r3 jobs as SkyPilot managed jobs via Ceph S3.
+
+Design: docs/specs/2026-11-23-xr3-sky-design.md. Pure logic lives in xr3skylib.py
+(helpers) and xr3skys3.py (object store, push planning); this file wires them to
+r3, git, `sky` and click.
+"""
+import functools
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+import click
+import r3
+from r3.job import GitDependency, JobDependency
+import yaml
+
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE))
+# xr3-sky reuses the suite-wide config loader that lives in the sibling xr3 dir.
+sys.path.insert(0, str(_HERE.parent / "xr3"))
+import xr3config  # noqa: E402
+
+import xr3skylib as lib  # noqa: E402
+import xr3skys3 as s3  # noqa: E402
+
+_BOOTSTRAP = _HERE / "xr3sky_bootstrap.sh"
+_AWS_SECRETS = ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")
+
+
+@functools.lru_cache(maxsize=1)
+def _config() -> dict:
+    return xr3config.load_config()
+
+
+def _sky_config() -> dict:
+    return _config()["sky"]
+
+
+def _store(cfg: dict) -> s3.Store:
+    """The S3 store for the `sky` config section (tests monkeypatch this)."""
+    return s3.BotoStore(cfg["bucket"], cfg["endpoint"], cfg["aws_profile"])
+
+
+def _build_query(tags, queries) -> dict:
+    """Build a Mongo-style query dict from tag/query CLI options.
+
+    Copied (intentionally) from xr3-slurm so xr3-sky stays self-contained.
+    - tags -> {"tags": {"$all": [...]}} (omitted if empty)
+    - queries: JSON fragments; bare `key: value` is wrapped in {...} and merged.
+    """
+    query: dict = {}
+    if tags:
+        query["tags"] = {"$all": list(tags)}
+    for q in queries:
+        if not q.startswith("{"):
+            q = f"{{{q}}}"
+        query_data = json.loads(q)
+        if not isinstance(query_data, dict):
+            raise ValueError(f"Query must be a JSON object, got {query_data}")
+        query.update(query_data)
+    return query
+
+
+# --- external commands ---------------------------------------------------------
+
+def _sky_bin() -> str:
+    sky = os.environ.get("XR3SKY_SKY") or shutil.which("sky")
+    if not sky:
+        raise click.ClickException("`sky` not found on PATH")
+    return sky
+
+
+def _preflight(store, need_sky: bool) -> None:
+    """Fail fast with a one-line fix: R3_REPOSITORY, S3 reachability, sky API."""
+    if not os.environ.get("R3_REPOSITORY"):
+        raise click.ClickException("R3_REPOSITORY is not set")
+    try:
+        store.ping()
+    except s3.StoreUnreachable:
+        raise click.ClickException("S3 unreachable — connect to the Stanford VPN")
+    if need_sky:
+        rc = subprocess.run([_sky_bin(), "api", "info"], capture_output=True).returncode
+        if rc != 0:
+            raise click.ClickException("SkyPilot API unreachable — run sky-up")
+
+
+def _r3_ref() -> str:
+    r3_root = Path(r3.__file__).resolve().parents[1]
+    try:
+        return subprocess.run(["git", "-C", str(r3_root), "rev-parse", "HEAD"],
+                              capture_output=True, text=True, check=True).stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        raise click.ClickException(f"cannot determine the r3 commit in {r3_root}: {e}")
+
+
+def _git(repo_dir: Path, *args) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(repo_dir), *args],
+                          capture_output=True, text=True)
+
+
+def _make_bundle(repo_dir: Path, commit: str, out: Path) -> None:
+    """`git bundle create` with exactly `commit`; via a temporary ref if needed."""
+    if _git(repo_dir, "bundle", "create", str(out), commit).returncode == 0:
+        return
+    ref = f"refs/xr3sky/{commit}"
+    r = _git(repo_dir, "update-ref", ref, commit)
+    if r.returncode != 0:
+        raise click.ClickException(
+            f"commit {commit} not found in {repo_dir}: {r.stderr.strip()}")
+    try:
+        r = _git(repo_dir, "bundle", "create", str(out), ref)
+        if r.returncode != 0:
+            raise click.ClickException(
+                f"git bundle create failed in {repo_dir}: {r.stderr.strip()}")
+    finally:
+        _git(repo_dir, "update-ref", "-d", ref)
+
+
+# --- dependency closure ----------------------------------------------------------
+
+def _dep_info(job) -> s3.DepInfo:
+    out = Path(job.path) / "output"
+    has_out = out.is_dir()
+    done = out / "done"
+    state = lib.effective_done(None, done.read_text() if done.is_file() else None)
+    return s3.DepInfo(
+        job_id=job.id,
+        local_output=out if has_out else None,
+        local_done=state == "completed",
+        has_remote_yaml=has_out and (out / "REMOTE.yaml").is_file(),
+        env_marker=has_out and ((out / "container.sif").exists()
+                                or (out / "env" / "interpreter_path.txt").exists()),
+        job_dir=Path(job.path),
+    )
+
+
+def _deps_closure(repo, job) -> tuple:
+    """Transitive job dependencies (deduped, BFS order) and git deps (path, commit)."""
+    deps: dict = {}
+    git: dict = {}
+    queue = [job]
+    while queue:
+        current = queue.pop(0)
+        for d in current.dependencies:
+            if isinstance(d, JobDependency):
+                if d.job in deps or d.job == job.id:
+                    continue
+                try:
+                    dep_job = repo[d.job]
+                except KeyError:
+                    raise click.ClickException(
+                        f"dependency {d.job} of {current.id} not in the repository")
+                deps[d.job] = _dep_info(dep_job)
+                queue.append(dep_job)
+            elif isinstance(d, GitDependency):
+                if not d.commit:
+                    raise click.ClickException(
+                        f"unresolved git dependency {d.repository} in {current.id}")
+                git[(str(d.repository_path), d.commit)] = None
+            else:
+                raise click.ClickException(
+                    f"unresolved dependency {d.to_config()} in {current.id}")
+    return list(deps.values()), list(git)
+
+
+# --- rendering -------------------------------------------------------------------
+
+class _BlockDumper(yaml.SafeDumper):
+    pass
+
+
+def _str_repr(dumper, data):
+    style = "|" if "\n" in data else None
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data, style=style)
+
+
+_BlockDumper.add_representer(str, _str_repr)
+
+
+def _dump(task: dict) -> str:
+    return yaml.dump(task, Dumper=_BlockDumper, sort_keys=False, width=1 << 16,
+                     allow_unicode=True)
+
+
+def _fmt_bytes(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1000:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1000
+    return f"{n:.1f} TB"
+
+
+def _print_plan(plan: s3.PushPlan, verbose: int) -> None:
+    groups: dict = {}
+    for p, key in plan.uploads:
+        marker = "/files/" if "/files/" in key else "/output/"
+        prefix = key[:key.index(marker) + len(marker)]
+        n, size = groups.get(prefix, (0, 0))
+        groups[prefix] = (n + 1, size + p.stat().st_size)
+    print(f"Upload plan: {len(plan.uploads)} files, {_fmt_bytes(plan.total_bytes)}")
+    for prefix, (n, size) in groups.items():
+        print(f"  upload {prefix} ({n} files, {_fmt_bytes(size)})")
+    if verbose >= 2:
+        for p, key in plan.uploads:
+            print(f"    {p} -> {key}")
+    for key in plan.missing_bundles:
+        print(f"  bundle {key}")
+    for key in plan.complete_markers:
+        print(f"  marker {key}")
+    for job_id in plan.skipped:
+        print(f"  already in S3: {job_id}")
+    for w in plan.warnings:
+        print(f"  WARNING: {w}")
+
+
+# --- secrets -----------------------------------------------------------------------
+
+def _secret_env(names, profile: Optional[str]) -> dict:
+    """Child env for `sky`: os.environ plus AWS creds from the profile if missing."""
+    env = dict(os.environ)
+    missing_aws = [n for n in _AWS_SECRETS if n in names and not env.get(n)]
+    if missing_aws:
+        import boto3
+        creds = boto3.Session(profile_name=profile).get_credentials()
+        if creds is None:
+            raise click.ClickException(f"no AWS credentials in profile {profile!r}")
+        frozen = creds.get_frozen_credentials()
+        values = {"AWS_ACCESS_KEY_ID": frozen.access_key,
+                  "AWS_SECRET_ACCESS_KEY": frozen.secret_key}
+        for n in missing_aws:
+            env[n] = values[n]
+    unset = [n for n in names if not env.get(n)]
+    if unset:
+        raise click.ClickException(
+            f"secret(s) not set in the environment: {', '.join(unset)}")
+    return env
+
+
+# --- launch ------------------------------------------------------------------------
+
+def _launch_job(path: Path, repo, store, sky_cfg: dict, layout: lib.S3Layout, *,
+                dry: bool, infra: Optional[str], whole_card: bool, allow_high: bool,
+                restart_failed: bool, fresh: bool, allow_unfinished: bool, yes: bool,
+                user: str, r3_ref: str, verbose: int) -> bool:
+    path = path.absolute()
+    if not (path / "run.sh").exists():
+        raise click.ClickException(f"No run script in {path}.")
+    job_id = path.name
+    try:
+        uuid.UUID(job_id)
+    except ValueError:
+        raise click.ClickException(f"Job directory is not a valid UUID: {path}")
+    try:
+        job = repo[job_id]
+    except KeyError as e:
+        raise click.ClickException(str(e))
+
+    local_done = path / "output" / "done"
+    state = lib.effective_done(
+        store.read_text(layout.done(job_id)),
+        local_done.read_text() if local_done.is_file() else None)
+    decision = lib.launch_decision(state, restart_failed)
+    if decision == "skip":
+        print(f"{job_id}: skipping ({state})")
+        return False
+
+    # Everything below up to the confirm prompt is read-only: a refused spec or
+    # push plan leaves S3 untouched.
+    fragment = {}
+    if (path / "sky.yaml").is_file():
+        fragment = yaml.safe_load((path / "sky.yaml").read_text()) or {}
+    try:
+        task = lib.merge_task(sky_cfg.get("defaults") or {}, fragment)
+        task = lib.validate_and_fill(task, whole_card=whole_card,
+                                     allow_high=allow_high, infra_override=infra)
+    except lib.SkySpecError as e:
+        raise click.ClickException(f"{job_id}: {e}")
+
+    deps, git_deps = _deps_closure(repo, job)
+    try:
+        plan = s3.plan_push(job_id, path, deps, git_deps, store, layout, allow_unfinished)
+    except s3.PushError as e:
+        raise click.ClickException(f"{job_id}: {e}")
+
+    name = lib.managed_job_name(user, job_id)
+    git_triples = [(hashlib.sha256(p.encode()).hexdigest(), p, c) for p, c in git_deps]
+    rendered = lib.render_task(
+        name=name, job_id=job_id, task=task, deps=[d.job_id for d in deps],
+        git=git_triples, sky_cfg=sky_cfg, r3_ref=r3_ref,
+        bootstrap_text=_BOOTSTRAP.read_text(),
+        secret_names=list(sky_cfg.get("secrets") or []))
+    task_yaml = _dump(rendered)
+    secret_names = list(rendered["secrets"])
+
+    if dry:
+        print(f"Would launch {job_id} as {name}"
+              + (" (rewriting failed -> restart)" if decision == "launch_rewrite_restart" else "")
+              + (" (deleting S3 output first)" if fresh else ""))
+        _print_plan(plan, verbose)
+        print("--- task.yaml ---")
+        print(task_yaml)
+        return True
+
+    if verbose >= 1:
+        _print_plan(plan, verbose)
+    limit = lib.parse_size(sky_cfg["push_confirm_above"])
+    if plan.total_bytes > limit and not yes:
+        click.confirm(f"{job_id}: push {_fmt_bytes(plan.total_bytes)} to S3?", abort=True)
+    for w in plan.warnings:
+        print(f"WARNING: {w}")
+    env = _secret_env(secret_names, sky_cfg.get("aws_profile"))
+
+    if decision == "launch_rewrite_restart":
+        store.write_text(layout.done(job_id), "restart\n")
+        if local_done.is_file():
+            local_done.write_text("restart\n")
+    if fresh:
+        store.delete_prefix(layout.output(job_id))
+        store.delete_prefix(layout.complete(job_id))
+
+    bundle_src = {layout.git_bundle(p, c): (p, c) for p, c in git_deps}
+    try:
+        for src, key in plan.uploads:
+            store.upload_file(src, key)
+        with tempfile.TemporaryDirectory() as tmp:
+            for key in plan.missing_bundles:
+                repo_path, commit = bundle_src[key]
+                out = Path(tmp) / f"{commit}.bundle"
+                _make_bundle(Path(repo.path) / repo_path, commit, out)
+                store.upload_file(out, key)
+    except click.ClickException:
+        raise
+    except Exception as e:
+        raise click.ClickException(f"{job_id}: upload failed, nothing submitted: {e}")
+    for key in plan.complete_markers:
+        store.write_text(key, "")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    store.write_text(layout.run_record(job_id, ts), task_yaml)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        yaml_path = Path(tmp) / f"{name}.yaml"
+        yaml_path.write_text(task_yaml)
+        argv = [_sky_bin(), "jobs", "launch", "-y", "-n", name]
+        for n in secret_names:
+            argv += ["--secret", n]
+        argv.append(str(yaml_path))
+        print(f"{job_id}: launching {name}")
+        rc = subprocess.run(argv, env=env).returncode
+    if rc != 0:
+        raise click.ClickException(f"{job_id}: sky jobs launch failed (exit {rc})")
+    return True
+
+
+@click.group()
+def cli():
+    """Launch committed r3 jobs as SkyPilot managed jobs (state in Ceph S3)."""
+
+
+@cli.command()
+@click.argument("job_ids", nargs=-1)
+@click.option("-t", "--tag", "tags", multiple=True, type=str,
+              help="Select jobs having all these tags (repeatable).")
+@click.option("-q", "--query", "queries", multiple=True, type=str,
+              help="Select jobs by a JSON query fragment (repeatable).")
+@click.option("--dry", is_flag=True, help="Print the task YAML and upload plan; write nothing.")
+@click.option("--infra", default=None, help="SkyPilot infra (e.g. k8s/at).")
+@click.option("--whole-card", is_flag=True, help="Fill gpumem with the whole card.")
+@click.option("--allow-high", is_flag=True, help="Allow priority class 'high'.")
+@click.option("-r", "--restart-failed", is_flag=True, help="Relaunch jobs marked failed.")
+@click.option("--fresh", is_flag=True, help="Delete the job's S3 output before launching.")
+@click.option("--allow-unfinished-deps", is_flag=True,
+              help="Push dependencies that have no output/done.")
+@click.option("--yes", is_flag=True, help="Do not ask before large pushes.")
+@click.option("-v", "--verbose", count=True, help="Increase verbosity (repeatable).")
+def launch(job_ids, tags, queries, dry, infra, whole_card, allow_high, restart_failed,
+           fresh, allow_unfinished_deps, yes, verbose):
+    """Launch jobs on SkyPilot, selected by JOB_IDS and/or --tag/--query."""
+    sky_cfg = _sky_config()
+    store = _store(sky_cfg)
+    _preflight(store, need_sky=not dry)
+    try:
+        user = lib.sky_user(sky_cfg, os.environ)
+    except ValueError as e:
+        raise click.ClickException(str(e))
+
+    repository = r3.Repository(os.environ["R3_REPOSITORY"])
+    paths = [repository.path / "jobs" / str(job_id) for job_id in job_ids]
+    if tags or queries:
+        query = _build_query(tags, queries)
+        print(f"Selecting jobs with query:\n{json.dumps(query, indent=2)}")
+        for job in repository.find(query=query):
+            print(f"  {job.id}: {job.metadata.get('tags', ['no tags'])[0]}")
+            paths.append(Path(job.path))
+    paths = list(dict.fromkeys(Path(p) for p in paths))
+    if not paths:
+        raise click.ClickException("No jobs selected (give JOB_IDS, --tag, or --query).")
+
+    layout = lib.S3Layout(str(sky_cfg["prefix"]).rstrip("/"))
+    r3_ref = _r3_ref()
+    for path in paths:
+        _launch_job(path, repository, store, sky_cfg, layout, dry=dry, infra=infra,
+                    whole_card=whole_card, allow_high=allow_high,
+                    restart_failed=restart_failed, fresh=fresh,
+                    allow_unfinished=allow_unfinished_deps, yes=yes, user=user,
+                    r3_ref=r3_ref, verbose=verbose)
+
+
+if __name__ == "__main__":
+    cli()

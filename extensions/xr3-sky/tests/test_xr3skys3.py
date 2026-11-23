@@ -189,3 +189,48 @@ def test_memory_store_byte_faithful(tmp_path):
     assert dst.read_bytes() == b"\x00\xff\x10"
     assert st.list("p/")[0].etag == hashlib.md5(b"\x00\xff\x10").hexdigest()
     assert st.delete_prefix("p/") == 1 and not st.exists("p/k")
+
+
+def make_dep_with_files(tmp_path, name="dep1", **kw):
+    dep = make_dep(tmp_path, name, **kw)
+    jd = dep.local_output.parent
+    (jd / "r3.yaml").write_text("dependencies: []\n")
+    (jd / "run.sh").write_text("echo dep\n")
+    dep.job_dir = jd
+    return dep
+
+
+def test_depinfo_job_dir_defaults_to_none():
+    assert s3.DepInfo("d", None, False, False, False).job_dir is None
+
+
+def test_plan_push_uploads_dep_job_files_except_output(tmp_path):
+    job = make_job(tmp_path)
+    dep = make_dep_with_files(tmp_path)
+    p = plan(job, [dep], s3.MemoryStore())
+    keys = {k for _, k in p.uploads}
+    assert {"r3/jobs/dep1/files/r3.yaml", "r3/jobs/dep1/files/run.sh"} <= keys
+    assert not any(k.startswith("r3/jobs/dep1/files/output") for k in keys)
+    assert p.complete_markers[0] == "r3/jobs/J/files.complete"
+    assert "r3/jobs/dep1/files.complete" in p.complete_markers
+    assert "r3/jobs/dep1/output.complete" in p.complete_markers
+
+
+def test_plan_push_dep_files_skipped_when_files_complete(tmp_path):
+    job = make_job(tmp_path)
+    dep = make_dep_with_files(tmp_path, has_remote_yaml=True)
+    store = s3.MemoryStore()
+    store.write_text(LAYOUT.files_complete("dep1"), "")
+    p = plan(job, [dep], store)
+    assert not any("dep1" in k for _, k in p.uploads)
+    assert "r3/jobs/dep1/files.complete" not in p.complete_markers
+
+
+def test_plan_push_dep_files_pushed_even_if_output_remote(tmp_path):
+    job = make_job(tmp_path)
+    dep = make_dep_with_files(tmp_path, has_remote_yaml=True)
+    p = plan(job, [dep], s3.MemoryStore())
+    keys = {k for _, k in p.uploads}
+    assert "r3/jobs/dep1/files/r3.yaml" in keys
+    assert not any(k.startswith("r3/jobs/dep1/output/") for k in keys)
+    assert "r3/jobs/dep1/files.complete" in p.complete_markers
