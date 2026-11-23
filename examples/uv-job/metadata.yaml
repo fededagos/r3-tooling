@@ -1,0 +1,17 @@
+# Editable labels. r3 only reads `tags` (a list) and `path` (a /-separated name); everything
+# else here is for you. Unlike the frozen r3.yaml, metadata can change at any time.
+path: PROJECT/experiments/DATE_SLUG/compute
+tags:
+  # The main tag = path + version (house convention: tags[0]).
+  - PROJECT/experiments/DATE_SLUG/compute/v1.0.0
+  - USER                                           # house convention: your username
+  - CLUSTER                                         # house convention: where it runs (e.g. sky)
+  - compute                                         # semantic tag (cross-cutting filter)
+versions:
+  - version: 1.0.0
+    comment: One-line changelog for this version.
+projects:
+  - PROJECT
+comment: >-
+  One paragraph: what this job computes and why. Environment from uv.lock (uv-lockfile
+  archetype); runs locally, under SLURM, or on SkyPilot via xr3-sky.

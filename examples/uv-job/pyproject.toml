@@ -1,0 +1,9 @@
+# The job's Python environment, pinned by the sibling uv.lock. No [build-system]:
+# uv treats this as a virtual project and installs only the dependencies.
+[project]
+name = "uv-job"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "pyyaml>=6",
+]

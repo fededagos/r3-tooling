@@ -1,0 +1,7 @@
+# SkyPilot task fragment for `xr3-sky launch`, merged over the `sky.defaults` in
+# ~/.config/xr3.yaml (this file wins). Allowed keys: resources, config, envs,
+# secrets (names only), num_nodes (must be 1). See extensions/xr3-sky/README.md.
+#
+# CPU-only, so the job may float between clusters; narrow it with
+# `xr3-sky launch --infra k8s/at <id>` if you need one cluster.
+resources: {cpus: 1, memory: 2}

@@ -1,0 +1,10 @@
+# What this job reads. The environment is NOT a dependency here: pyproject.toml + uv.lock
+# in the job define it, and run_inner.sh builds it with `uv sync --frozen`.
+dependencies: []
+  # Typical additions (see examples/compute-job/r3.yaml):
+  # - find_latest: { path: PROJECT/datasets/DATASET }   # input data, symlinked at ./data
+  #   source: output
+  #   destination: data
+  # - repository: https://github.com/USER/LIBRARY.git   # a library as a git dependency
+  #   commit: <sha>
+  #   destination: lib

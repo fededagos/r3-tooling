@@ -1,0 +1,16 @@
+path: PROJECT/datasets/DATASET_pointer
+tags:
+  # Main tag = path + version. Downstream jobs depend on it by path like any dataset job.
+  - PROJECT/datasets/DATASET_pointer/v1.0.0
+  - USER
+  - dataset
+  - pointer
+versions:
+  - version: 1.0.0
+    comment: Points at Spiral PROJECT/DATASET/TABLE as of asof_us; see README.md.
+projects:
+  - PROJECT
+comment: >-
+  Pointer job: a versioned reference to data held outside r3 (here a Spiral table).
+  output/pointer.yaml is the manifest; the data itself is fetched by the consumer.
+  No run step.

@@ -36,11 +36,16 @@ duplicate example (two sources of truth drift). The design rationale is in
 - **[`grid-search/`](grid-search/)** — fan a `template_job/` out over a grid (`setup_tasks.py`) and
   submit it to SLURM resumably, under the submit limit (`auto_submit.py`), including the array/batch
   mode for a single heavy cell.
+- **[`pointer-job/`](pointer-job/)** — a versioned reference to data held outside r3 (a Spiral table,
+  a W&B artifact, an S3 object): `output/pointer.yaml` names it, consumers fetch it. No `run.sh`.
 - **[`raw-data/`](raw-data/)** — a "job you don't run": externally-received data held with a README
   as its provenance record (the `_raw`/entry-node archetype). No `run.sh`.
 - **[`report/`](report/)** — the house report scaffold: `report.qmd` + `styles.css` with the
   standard section layout (`tl;dr` → Introduction / Method / Results / Discussion / Follow up ideas
   / Appendix). See [`report/README.md`](report/README.md).
+- **[`uv-job/`](uv-job/)** — a compute job whose environment is a `pyproject.toml` + `uv.lock` in the
+  job (`uv sync --frozen` / `uv run`), so it runs unchanged on a laptop, under SLURM, and on SkyPilot
+  via `xr3-sky` (its `sky.yaml` asks for 1 CPU / 2 GB).
 
 ## To come
 

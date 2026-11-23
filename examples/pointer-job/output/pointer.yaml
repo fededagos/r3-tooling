@@ -1,0 +1,16 @@
+# A pointer to data that lives outside r3. Downstream jobs read this manifest and
+# fetch the data themselves. `kind` selects the fields; this example is `spiral`.
+kind: spiral
+project: PROJECT             # Spiral project
+dataset: DATASET             # Spiral dataset within the project
+table: TABLE                 # table name
+asof_us: 1795000000000000    # snapshot time, microseconds since the epoch: read the table AS OF this
+content_sha256: null         # sha256 of the scanned data, if feasible: lets a reader verify the snapshot
+# CAVEAT: Spiral tables are mutable, and an `asof` read only works while Spiral retains
+# the old version. That retention is unconfirmed. For long-lived reproducibility, freeze a
+# copy of the table (e.g. a `<table>_<snapshot-name>` table nobody writes to again) and
+# point at the frozen copy instead of the live table.
+#
+# Other kinds (same file, different fields):
+#   kind: wandb   artifact: ENTITY/PROJECT/ARTIFACT:VERSION   (or run: ENTITY/PROJECT/RUN_ID)
+#   kind: s3      uri: s3://BUCKET/KEY   version_id: ...      (or etag: ... when the bucket is unversioned)
