@@ -16,4 +16,5 @@ workflow in **`RESEARCH_WORKFLOW.md`** — the sibling of this file in the r3-to
 project & path layout, `SPEC.md`→`PLAN.md`→implement, job archetypes, `run.sh`/environment,
 the develop→commit loop, reports, gotchas. **Read it before creating, running, or
 restructuring an experiment.** Tooling setup (the `r3` / `xr3` / `xr3-slurm` commands on
-`$PATH`, `$R3_REPOSITORY`): the repo's `SETUP.md`.
+`$PATH`, `$R3_REPOSITORY`): the repo's `SETUP.md`. Running jobs on SkyPilot / the lab's
+Kubernetes clusters (at, morpho, DO): `xr3-sky`, via the **`xr3-sky` skill**.
