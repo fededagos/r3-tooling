@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -115,6 +116,8 @@ def _managed_jobs(skip_finished: bool) -> list:
         r = subprocess.run(argv, capture_output=True, text=True, timeout=120)
     except subprocess.TimeoutExpired:
         raise click.ClickException("`sky jobs queue` timed out — run sky-up")
+    except OSError as e:
+        raise click.ClickException(f"cannot run `sky jobs queue`: {e}")
     if r.returncode != 0:
         raise click.ClickException(
             f"`sky jobs queue` failed (exit {r.returncode}): {r.stderr.strip()}")
@@ -448,6 +451,24 @@ def _launch_job(path: Path, repo, store, sky_cfg: dict, layout: lib.S3Layout, *,
     return True
 
 
+def _select_paths(repository, job_ids, tags, queries) -> list:
+    """Job dirs from JOB_IDS and/or --tag/--query, deduped by job id; error if none."""
+    paths = [repository.path / "jobs" / str(job_id) for job_id in job_ids]
+    if tags or queries:
+        query = _build_query(tags, queries)
+        print(f"Selecting jobs with query:\n{json.dumps(query, indent=2)}")
+        for job in repository.find(query=query):
+            print(f"  {job.id}: {job.metadata.get('tags', ['no tags'])[0]}")
+            paths.append(Path(job.path))
+    # dedup by job id: a job given as JOB_ID may also match --tag/--query
+    by_id: dict = {}
+    for p in paths:
+        by_id.setdefault(Path(p).name, Path(p))
+    if not by_id:
+        raise click.ClickException("No jobs selected (give JOB_IDS, --tag, or --query).")
+    return list(by_id.values())
+
+
 @click.group()
 def cli():
     """Launch committed r3 jobs as SkyPilot managed jobs (state in Ceph S3)."""
@@ -483,20 +504,7 @@ def launch(job_ids, tags, queries, dry, infra, whole_card, allow_high, restart_f
         raise click.ClickException(str(e))
 
     repository = r3.Repository(os.environ["R3_REPOSITORY"])
-    paths = [repository.path / "jobs" / str(job_id) for job_id in job_ids]
-    if tags or queries:
-        query = _build_query(tags, queries)
-        print(f"Selecting jobs with query:\n{json.dumps(query, indent=2)}")
-        for job in repository.find(query=query):
-            print(f"  {job.id}: {job.metadata.get('tags', ['no tags'])[0]}")
-            paths.append(Path(job.path))
-    # dedup by job id: a job given as JOB_ID may also match --tag/--query
-    by_id: dict = {}
-    for p in paths:
-        by_id.setdefault(Path(p).name, Path(p))
-    paths = list(by_id.values())
-    if not paths:
-        raise click.ClickException("No jobs selected (give JOB_IDS, --tag, or --query).")
+    paths = _select_paths(repository, job_ids, tags, queries)
 
     layout = lib.S3Layout(str(sky_cfg["prefix"]).rstrip("/"))
     r3_ref = _r3_ref()
@@ -509,6 +517,206 @@ def launch(job_ids, tags, queries, dry, infra, whole_card, allow_high, restart_f
                     r3_ref=r3_ref, verbose=verbose,
                     managed_jobs=managed_jobs,
                     force_duplicate=force_duplicate)
+
+
+# --- pull ----------------------------------------------------------------------------
+
+def _md5(path: Path) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _make_writable(path: Path) -> None:
+    """Add owner write (and search, for dirs) so we can write into / replace `path`."""
+    mode = path.stat().st_mode
+    extra = stat.S_IWUSR | (stat.S_IXUSR if path.is_dir() else 0)
+    if mode & extra != extra:
+        path.chmod(mode | extra)
+
+
+def _up_to_date(obj: s3.ObjectInfo, dest: Path) -> bool:
+    """Local file matches the remote object by size and, for plain-md5 etags, content."""
+    if not dest.is_file() or dest.stat().st_size != obj.size:
+        return False
+    etag = (obj.etag or "").strip('"')
+    if "-" in etag or not etag:  # multipart etag: not an md5, size match is all we have
+        return True
+    return _md5(dest) == etag
+
+
+def _pull_job(job_id: str, repo_path: Path, store, layout: lib.S3Layout, bucket: str,
+              max_bytes: Optional[int]) -> None:
+    prefix = layout.output(job_id)
+    objects = store.list(prefix)
+    if not objects:
+        print(f"no S3 output for {job_id}")
+        return
+    if store.read_text(layout.done(job_id)) is None:
+        print(f"{job_id}: in progress (no done marker in S3), skipping")
+        return
+    download, remote = s3.split_for_pull(objects, max_bytes)
+    out = repo_path / "jobs" / job_id / "output"
+    # r3 only write-protects the job dir, r3.yaml and the job files, never output/;
+    # we make sure it is writable anyway and leave modes as we find them.
+    out.mkdir(exist_ok=True)
+    _make_writable(out)
+    downloaded = skipped = 0
+    for obj in download:
+        rel = obj.key[len(prefix):]
+        if not rel or rel.endswith("/"):
+            continue
+        dest = out / rel
+        if _up_to_date(obj, dest):
+            skipped += 1
+            continue
+        for d in reversed([p for p in dest.parents if out in p.parents or p == out]):
+            if d.exists():
+                _make_writable(d)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists():
+            _make_writable(dest)
+        store.download_file(obj.key, dest)
+        downloaded += 1
+    ry = out / "REMOTE.yaml"
+    if remote:
+        if ry.exists():
+            _make_writable(ry)
+        ry.write_text(s3.remote_yaml(remote, bucket, prefix))
+    elif ry.exists():
+        ry.unlink()
+    print(f"{job_id}: downloaded {downloaded}, skipped {skipped} up-to-date, "
+          f"{len(remote)} remote ({_fmt_bytes(sum(o.size for o in remote))})")
+
+
+@cli.command()
+@click.argument("job_ids", nargs=-1)
+@click.option("-t", "--tag", "tags", multiple=True, type=str,
+              help="Select jobs having all these tags (repeatable).")
+@click.option("-q", "--query", "queries", multiple=True, type=str,
+              help="Select jobs by a JSON query fragment (repeatable).")
+@click.option("--max-size", default=None,
+              help="Leave files larger than this in S3 (default: sky.pull_max_size).")
+@click.option("--all", "all_files", is_flag=True, help="Download everything, ignoring --max-size.")
+def pull(job_ids, tags, queries, max_size, all_files):
+    """Download job outputs from S3 into the local r3 repository."""
+    sky_cfg = _sky_config()
+    store = _store(sky_cfg)
+    _preflight(store, need_sky=False)
+    try:
+        max_bytes = None if all_files else lib.parse_size(
+            max_size if max_size is not None else sky_cfg["pull_max_size"])
+    except ValueError as e:
+        raise click.ClickException(str(e))
+    repository = r3.Repository(os.environ["R3_REPOSITORY"])
+    paths = _select_paths(repository, job_ids, tags, queries)
+    layout = lib.S3Layout(str(sky_cfg["prefix"]).rstrip("/"))
+    for path in paths:
+        _pull_job(path.name, Path(repository.path), store, layout, sky_cfg["bucket"],
+                  max_bytes)
+
+
+# --- status / logs / cancel ------------------------------------------------------------
+
+def _sort_key(job: dict) -> float:
+    try:
+        return float(job.get("submitted_at"))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _newest_managed_job(name: str) -> Optional[dict]:
+    """The managed job called `name` with the greatest submitted_at, if any."""
+    matches = [j for j in _managed_jobs(skip_finished=False) if j.get("job_name") == name]
+    return max(matches, key=_sort_key) if matches else None
+
+
+def _sky_user() -> str:
+    try:
+        return lib.sky_user(_sky_config(), os.environ)
+    except ValueError as e:
+        raise click.ClickException(str(e))
+
+
+def _sky_passthrough(verb_args: list, job_id: str) -> None:
+    name = lib.managed_job_name(_sky_user(), job_id)
+    job = _newest_managed_job(name)
+    if job is None:
+        raise click.ClickException(f"no managed job named {name}")
+    argv = [_sky_bin(), "jobs", *verb_args, str(job["job_id"])]
+    sys.exit(subprocess.run(argv).returncode)  # stream: no capture
+
+
+@cli.command()
+@click.argument("job_id")
+@click.option("--controller", is_flag=True, help="Show the jobs controller's log.")
+def logs(job_id, controller):
+    """Stream logs of the newest managed job for JOB_ID."""
+    _sky_passthrough(["logs"] + (["--controller"] if controller else []), job_id)
+
+
+@cli.command()
+@click.argument("job_id")
+def cancel(job_id):
+    """Cancel the newest managed job for JOB_ID."""
+    _sky_passthrough(["cancel", "-y"], job_id)
+
+
+@cli.command()
+@click.argument("globs", nargs=-1)
+def status(globs):
+    """Show done and managed-job state for jobs whose tags match the GLOBS."""
+    sky_cfg = _sky_config()
+    if not os.environ.get("R3_REPOSITORY"):
+        raise click.ClickException("R3_REPOSITORY is not set")
+    store = _store(sky_cfg)
+    reachable = True
+    try:
+        store.ping()
+    except s3.StoreUnreachable:
+        reachable = False
+        print("(S3 unreachable — done column from local markers only)")
+    user = _sky_user()
+    repository = r3.Repository(os.environ["R3_REPOSITORY"])
+    query = {"$and": [{"tags": {"$glob": g}} for g in globs]} if globs else {}
+    jobs = repository.find(query=query)
+    if not jobs:
+        print("No jobs found.")
+        return
+    managed = None
+    try:
+        managed = _managed_jobs(skip_finished=False)
+    except click.ClickException as e:
+        print(f"(SkyPilot state unavailable: {e.message})")
+    newest: dict = {}
+    for j in managed or []:
+        cur = newest.get(j.get("job_name"))
+        if cur is None or _sort_key(j) >= _sort_key(cur):
+            newest[j.get("job_name")] = j
+    layout = lib.S3Layout(str(sky_cfg["prefix"]).rstrip("/"))
+    rows = [("r3 id", "tag", "done", "managed", "managed id")]
+    for job in sorted(jobs, key=lambda j: (j.metadata.get("tags") or [""])[0]):
+        local = Path(job.path) / "output" / "done"
+        remote_text = None
+        if reachable:
+            try:
+                remote_text = store.read_text(layout.done(job.id))
+            except Exception:
+                remote_text = None
+        done = lib.effective_done(remote_text,
+                                  local.read_text() if local.is_file() else None)
+        if managed is None:
+            mstate, mid = "?", "?"
+        else:
+            m = newest.get(lib.managed_job_name(user, job.id))
+            mstate, mid = (m.get("status"), str(m.get("job_id"))) if m else ("", "")
+        rows.append((job.id, (job.metadata.get("tags") or [""])[0], done or "-",
+                     mstate, mid))
+    widths = [max(len(str(r[i])) for r in rows) for i in range(5)]
+    for r in rows:
+        print("  ".join(str(c).ljust(w) for c, w in zip(r, widths)).rstrip())
 
 
 if __name__ == "__main__":
