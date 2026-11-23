@@ -7,11 +7,12 @@
 #      dependencies, git bundles) and runs `r3 rebuild-index`,
 #   3. syncs output/ to S3 every $XR3SKY_SYNC_INTERVAL seconds in the background,
 #   4. runs the job's unchanged house `run.sh`,
-#   5. on any exit: stops the sync loop, marks `failed` if run.sh failed, does a
-#      final sync (everything but `done`), then uploads `done` on its own, then
-#      writes output.complete when output/done is `completed`.
+#   5. on any exit: stops the sync loop, marks `failed` if run.sh failed and
+#      output/done is absent or `restart`, does a final sync (everything but
+#      `done`), then uploads `done` on its own, then writes output.complete when
+#      output/done is completed (see done_state: any body but restart/failed).
 # Exit status: run.sh's (143 on a termination signal); 1 if the final sync or a
-# marker upload fails, or if run.sh exits 0 without output/done = completed.
+# marker upload fails, or if run.sh exits 0 without a completed output/done.
 #
 # Outputs are never deleted remotely (no `sync --delete`). Nothing is uploaded to
 # S3 until output/ has been fully pre-populated from it, so a bootstrap failure
@@ -112,7 +113,22 @@ sync_loop() {
     done
 }
 
-done_state() { [ -f "$OUT/done" ] && tr -d '[:space:]' < "$OUT/done" || true; }
+# The state of output/done: absent | restart | failed | completed. Classified exactly
+# like the laptop (xr3skylib._classify_done) and xr3-slurm: the body is stripped of
+# leading/trailing whitespace; `restart` and `failed` are themselves, anything else
+# (including an empty file) is completed.
+done_state() {
+    [ -f "$OUT/done" ] || { echo absent; return 0; }
+    local body
+    body="$(cat "$OUT/done"; echo x)"
+    body="${body%x}"
+    body="${body#"${body%%[![:space:]]*}"}"
+    body="${body%"${body##*[![:space:]]}"}"
+    case "$body" in
+        restart|failed) echo "$body" ;;
+        *) echo completed ;;
+    esac
+}
 
 # --- exit handling ----------------------------------------------------------------
 on_signal() {
@@ -155,7 +171,7 @@ finish() {
 
     # 2. Mark failure (not on preemption/cancel: those resume from S3).
     state="$(done_state)"
-    if [ "$rc" -ne 0 ] && [ "$INTERRUPTED" = 0 ] && { [ -z "$state" ] || [ "$state" = restart ]; }; then
+    if [ "$rc" -ne 0 ] && [ "$INTERRUPTED" = 0 ] && { [ "$state" = absent ] || [ "$state" = restart ]; }; then
         log "job failed with exit $rc; writing output/done = failed"
         echo failed > "$OUT/done"
     fi
@@ -192,7 +208,7 @@ finish() {
     # 5. run.sh's guard exits 0 on any non-`restart` marker (e.g. a prior `failed`):
     #    that must not look like success.
     if [ "$rc" -eq 0 ] && [ "$INTERRUPTED" = 0 ] && [ "$state" != completed ]; then
-        log "ERROR: run.sh exited 0 but output/done is '${state:-absent}', not 'completed'"
+        log "ERROR: run.sh exited 0 but output/done is '$state', not 'completed'"
         rc=1
     fi
 

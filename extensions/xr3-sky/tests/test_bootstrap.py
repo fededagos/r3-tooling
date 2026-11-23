@@ -6,6 +6,8 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+
 HERE = Path(__file__).resolve().parent
 BOOTSTRAP = HERE.parent / "xr3sky_bootstrap.sh"
 FAKE_AWS = HERE / "fake_aws.sh"
@@ -345,3 +347,26 @@ def test_bootstrap_git_bundle_with_only_xr3sky_ref(tmp_path):
     assert r.returncode == 0, r.stderr
     bare = tmp_path / "root" / repo_path
     subprocess.run(["git", "-C", str(bare), "cat-file", "-e", f"{c}^{{commit}}"], check=True)
+
+
+@pytest.mark.parametrize("body", ["", "\n", "done\n"])
+def test_bootstrap_any_non_restart_failed_marker_is_completed(tmp_path, body):
+    """Same classification as the laptop (_classify_done): empty or any other body
+    than restart/failed is completed."""
+    env = setup(tmp_path, run_inner="exit 9\n")   # run.sh's guard skips the job
+    out = remote_output(tmp_path)
+    out.mkdir(parents=True)
+    (out / "r.txt").write_text("r")
+    (out / "done").write_text(body)
+    r = run(env)
+    assert r.returncode == 0, r.stderr
+    assert (out / "done").read_text() == body
+    assert (s3(tmp_path) / "jobs" / JOB / "output.complete").exists()
+
+
+def test_bootstrap_failure_does_not_overwrite_empty_completed_marker(tmp_path):
+    env = setup(tmp_path, run_inner=": > output/done\nexit 3\n")
+    r = run(env)
+    assert r.returncode == 3, r.stderr
+    out = remote_output(tmp_path)
+    assert (out / "done").read_text() == ""
